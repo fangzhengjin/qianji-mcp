@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+data
+dist
+coverage
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.jsonl
+.env
+.env.*
+.DS_Store
+README.md
