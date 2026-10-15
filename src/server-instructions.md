@@ -13,6 +13,8 @@
 - 资产：使用 `list_assets`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围，默认不返回余额和信用额度，只有用户明确要求查看余额或额度时才设 `includeBalances=true`
 - 借入或借出详情：使用 `list_debt_accounts`，`list_assets` 可能包含 type 5 债务记录基础资产条目，但不能替代详细信息，不要自行聚合两类响应
 - 分类：使用 `list_categories`
+- 分类图标：使用 `list_category_icons`
+- 删除分类的影响评估：使用 `check_category_deletion` 取得受影响账单数量
 - 标签：使用 `list_tags`
 - 账单批量盘点、查重或只读对账：使用 `list_bills`，`remarkKeyword` 按不区分大小写的字面子串匹配，需要完整筛选范围时继续翻页到 `nextCursor=null`
 - 共享账本按成员筛选：先使用 `list_book_members` 取得成员 ID，再传给 `list_bills.memberIds` 或 `get_bill_statistics.memberIds`
@@ -37,6 +39,8 @@
 
 退款和报销必须使用专用工具，不得自行构造账单关联关系。
 
+- 分类：创建一级分类使用 `create_categories`，批量创建子分类使用 `create_subcategories`，改名使用 `update_categories`，移动或调整层级使用 `move_category`，重排顺序使用 `reorder_categories`
+
 需要主动登录或重新登录当前钱迹账号时，使用 `connect_qianji` 获取一次性链接，未解绑的重新登录只能使用当前已连接的钱迹账号。
 
 #### 删除或取消
@@ -47,6 +51,7 @@
 - 单笔退款：使用 `delete_refund` 的 `refundBillId`
 - 单笔报销入账：使用 `delete_reimbursement` 的 `reimbursementBillId`
 - 取消一笔或多笔源账单的全部报销关系：使用 `cancel_reimbursements` 的 `sourceBillIds`，保留源账单并删除其报销入账子账单，不得传报销入账子账单 ID
+- 分类：使用 `delete_categories` 的 `deletions`，可选择把账单转移到其他分类或连同账单一起删除
 - 当前 PAT 的钱迹账号绑定：使用 `disconnect_qianji`，账号未被其他 PAT 使用时会删除全部本地数据，不会删除钱迹云端数据
 
 完成当前用户请求所需的全部调用后，将最终结果交付用户并结束本次操作。

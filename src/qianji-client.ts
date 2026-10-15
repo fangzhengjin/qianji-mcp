@@ -194,6 +194,15 @@ function stringifyQianjiIdList(ids: string[]): string {
   }));
 }
 
+/** 将分类 ID 列表序列化为保持精度的 JSON 数字数组。 */
+function stringifyQianjiCategoryIdList(ids: string[]): string {
+  const json = JSON as JsonWithRaw;
+  return JSON.stringify(ids.map((id) => {
+    if (!isPositiveLongId(id)) throw new AppError("QIANJI_PAYLOAD_INVALID", "钱迹分类 ID 无效");
+    return json.rawJSON(id);
+  }));
+}
+
 /** 钱迹私有 API 共用的表单编码 HTTP 客户端。 */
 export class QianjiClient {
   private readonly baseUrl: URL;
@@ -329,6 +338,96 @@ export class QianjiClient {
   async listCategories(account: QianjiAccount, bookId: string, type: -1 | 0 | 1): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/category/listv2", { bookid: bookId, t: type }));
     return asObjectArray(data.list).map(normalizeCategory);
+  }
+
+  /** 创建分类；`v` 直接使用分类名称纯文本，响应携带分类对象时返回其规范化结果。 */
+  async createCategory(
+    account: QianjiAccount,
+    input: { bookId: string; name: string; type: 0 | 1; parentId?: string; icon?: string },
+  ): Promise<Record<string, unknown> | undefined> {
+    const body: Record<string, string | number> = {
+      bookid: input.bookId,
+      v: input.name,
+      t: input.type,
+    };
+    if (input.parentId !== undefined) body.parentid = input.parentId;
+    if (input.icon !== undefined) body.icon = input.icon;
+    const data = await this.authPost(account, "/category/submitv2", body);
+    if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const object = data as Record<string, unknown>;
+    return object.id === undefined && object.cateid === undefined ? undefined : normalizeCategory(object);
+  }
+
+  /** 按分类 ID 重命名分类。 */
+  async updateCategory(account: QianjiAccount, categoryId: string, name: string): Promise<void> {
+    await this.authPost(account, "/category/submitv2", { did: categoryId, v: name });
+  }
+
+  /** 删除分类，可把账单转移到其他分类或连同账单一起删除。 */
+  async deleteCategory(
+    account: QianjiAccount,
+    categoryId: string,
+    options: { transferTo?: string; deleteBills?: boolean } = {},
+  ): Promise<void> {
+    const body: Record<string, string | number> = { did: categoryId };
+    if (options.transferTo !== undefined) body.newcateid = options.transferTo;
+    if (options.deleteBills) body.deletebills = 1;
+    await this.authPost(account, "/category/deletev2", body);
+  }
+
+  /** 检查删除分类会影响的账单数量。 */
+  async deleteCategoryCheck(
+    account: QianjiAccount,
+    categoryId: string,
+  ): Promise<{ count: number; other?: unknown }> {
+    const data = asObject(await this.authPost(account, "/category/deletecheckv2", { did: categoryId }));
+    const count = Number(data.count ?? 0);
+    if (!Number.isInteger(count) || count < 0) {
+      throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹返回了无效账单数", 502);
+    }
+    return { count, ...(data.other !== undefined ? { other: data.other } : {}) };
+  }
+
+  /** 将分类移动到另一一级分类下。 */
+  async moveCategory(account: QianjiAccount, categoryId: string, parentId: string): Promise<void> {
+    await this.authPost(account, "/category/movesubcate", { did: categoryId, parentid: parentId });
+  }
+
+  /** 调整分类层级，`parentId` 传 `-1` 时提升为一级分类。 */
+  async changeCategoryLevel(account: QianjiAccount, categoryId: string, parentId: string): Promise<void> {
+    await this.authPost(account, "/category/changelevel", { did: categoryId, parentid: parentId });
+  }
+
+  /** 按给定 ID 顺序重排分类，`v` 使用保持精度的 JSON 数字数组。 */
+  async reorderCategories(account: QianjiAccount, orderedIds: string[]): Promise<void> {
+    await this.authPost(account, "/category/reorder3", { v: stringifyQianjiCategoryIdList(orderedIds) });
+  }
+
+  /** 批量创建指定真实一级分类下的子分类。 */
+  async submitMultipleCategories(
+    account: QianjiAccount,
+    input: { bookId: string; parentId: string; type: 0 | 1; names: string[] },
+  ): Promise<{ list: Record<string, unknown>[]; repeats: unknown[] }> {
+    const data = asObject(await this.authPost(account, "/category/submitmultiple", {
+      bookid: input.bookId,
+      t: input.type,
+      parentid: input.parentId,
+      v: JSON.stringify(input.names.map((name) => ({ name }))),
+    }));
+    return {
+      list: asObjectArray(data.list).map(normalizeCategory),
+      repeats: data.repeats === undefined ? [] : asArray(data.repeats),
+    };
+  }
+
+  /** 读取分类图标分组。 */
+  async listCategoryIcons(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    const data = asObject(await this.authPost(account, "/category/iconlist", {}));
+    return asObjectArray(data.list).map((icon) => ({
+      ...icon,
+      group: String(icon.group ?? ""),
+      groupName: String(icon.groupname ?? ""),
+    }));
   }
 
   /** 读取指定账本和月份或年份的预算定义。 */

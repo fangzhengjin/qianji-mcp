@@ -2,7 +2,7 @@ import { randomInt } from "node:crypto";
 
 import { decimalAdd, decimalRound, decimalSubtract } from "./decimal.ts";
 import { AppError } from "./errors.ts";
-import { isCurrencySymbol, isOptionalPositiveLongId, isPositiveLongId } from "./ids.ts";
+import { isCurrencySymbol, isOptionalPositiveLongId, isParentLongId, isPositiveLongId } from "./ids.ts";
 import { isRawJsonNumber, type SyncBillResult } from "./qianji-client.ts";
 
 export type BillIdInput = string;
@@ -223,6 +223,20 @@ function addOptionalCurrencyAmount(
 export const MAX_MONEY = 9_999_999_999.99;
 export const MAX_SEARCH_KEYWORD_LENGTH = 42;
 export const MAX_BILL_CURSOR_LENGTH = 65_536;
+export const MAX_CATEGORY_NAME_LENGTH = 50;
+
+/** 规范化分类名称，拒绝空白或超长文本。 */
+export function normalizeCategoryName(value: string, code = "INVALID_CATEGORY_NAME"): string {
+  const name = value.trim();
+  if (!name || name.length > MAX_CATEGORY_NAME_LENGTH) throw new AppError(code, "分类名称无效");
+  return name;
+}
+
+/** 规范化允许 `-1` 和 `0` 哨兵值的分类父 ID。 */
+export function normalizeCategoryParentId(value: ReferenceIdInput): string {
+  if (!isParentLongId(value)) throw new AppError("INVALID_CATEGORY_PARENT", "父分类 ID 无效");
+  return value;
+}
 
 /** 规范化账单 ID，并拒绝会丢失精度的 JavaScript 数字表示。 */
 export function normalizeBillId(value: BillIdInput): string {
