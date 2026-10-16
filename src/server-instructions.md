@@ -40,6 +40,7 @@
 退款和报销必须使用专用工具，不得自行构造账单关联关系。
 
 - 分类：创建一级分类使用 `create_categories`，批量创建子分类使用 `create_subcategories`，改名使用 `update_categories`，移动或调整层级使用 `move_category`，重排顺序使用 `reorder_categories`
+- 标签：创建使用 `create_tags`，创建标签组使用 `create_tag_groups`，改名、移动分组或改色使用 `update_tags`，重排标签使用 `reorder_tags`，重排标签组使用 `reorder_tag_groups`
 
 需要主动登录或重新登录当前钱迹账号时，使用 `connect_qianji` 获取一次性链接，未解绑的重新登录只能使用当前已连接的钱迹账号。
 
@@ -52,6 +53,7 @@
 - 单笔报销入账：使用 `delete_reimbursement` 的 `reimbursementBillId`
 - 取消一笔或多笔源账单的全部报销关系：使用 `cancel_reimbursements` 的 `sourceBillIds`，保留源账单并删除其报销入账子账单，不得传报销入账子账单 ID
 - 分类：使用 `delete_categories` 的 `deletions`，可选择把账单转移到其他分类或连同账单一起删除
+- 标签：使用 `delete_tags` 的 `tagIds`，删除标签组使用 `delete_tag_groups` 的 `groupIds`，保留标签但不再使用可改用 `archive_tags` 的 `tagIds` 归档
 - 当前 PAT 的钱迹账号绑定：使用 `disconnect_qianji`，账号未被其他 PAT 使用时会删除全部本地数据，不会删除钱迹云端数据
 
 完成当前用户请求所需的全部调用后，将最终结果交付用户并结束本次操作。

@@ -203,6 +203,14 @@ function stringifyQianjiCategoryIdList(ids: string[]): string {
   }));
 }
 
+/** 将不透明标签 ID 列表序列化为 JSON 字符串数组。 */
+function stringifyTagIdList(ids: string[], resource: string): string {
+  return JSON.stringify(ids.map((id) => {
+    if (!id) throw new AppError("QIANJI_PAYLOAD_INVALID", `钱迹${resource} ID 无效`);
+    return id;
+  }));
+}
+
 /** 钱迹私有 API 共用的表单编码 HTTP 客户端。 */
 export class QianjiClient {
   private readonly baseUrl: URL;
@@ -471,6 +479,66 @@ export class QianjiClient {
         groupName,
       }));
     });
+  }
+
+  /** 创建或重命名标签组；`v` 直接使用组名纯文本，响应携带 ID 时返回其规范化结果。 */
+  async createTagGroup(account: QianjiAccount, name: string): Promise<Record<string, unknown> | undefined> {
+    const data = await this.authPost(account, "/tag/submitgroup", { v: name });
+    if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const object = data as Record<string, unknown>;
+    return object.id === undefined ? undefined : { ...object, id: opaqueIdText(object.id, "标签组") };
+  }
+
+  /** 按标签组 ID 删除标签组。 */
+  async deleteTagGroup(account: QianjiAccount, groupId: string): Promise<void> {
+    await this.authPost(account, "/tag/deletegroup", { did: groupId });
+  }
+
+  /** 创建标签；`v` 使用 JSON 字符串载荷，响应携带 ID 时返回其规范化结果。 */
+  async createTag(
+    account: QianjiAccount,
+    input: { name: string; groupId?: string; color?: string },
+  ): Promise<Record<string, unknown> | undefined> {
+    const payload: Record<string, string> = { name: input.name };
+    if (input.groupId !== undefined) payload.groupid = input.groupId;
+    if (input.color !== undefined) payload.color = input.color;
+    const data = await this.authPost(account, "/tag/submittag", { v: JSON.stringify(payload) });
+    if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const object = data as Record<string, unknown>;
+    return object.id === undefined ? undefined : { ...object, id: opaqueIdText(object.id, "标签") };
+  }
+
+  /** 按标签 ID 修改标签名称、所属组或颜色，`v` 使用仅含变更字段的 JSON 字符串载荷。 */
+  async updateTag(
+    account: QianjiAccount,
+    tagId: string,
+    patch: { name?: string; groupId?: string; color?: string },
+  ): Promise<void> {
+    const payload: Record<string, string> = {};
+    if (patch.name !== undefined) payload.name = patch.name;
+    if (patch.groupId !== undefined) payload.groupid = patch.groupId;
+    if (patch.color !== undefined) payload.color = patch.color;
+    await this.authPost(account, "/tag/submittag", { did: tagId, v: JSON.stringify(payload) });
+  }
+
+  /** 按标签 ID 删除标签。 */
+  async deleteTag(account: QianjiAccount, tagId: string): Promise<void> {
+    await this.authPost(account, "/tag/deletetag", { did: tagId });
+  }
+
+  /** 按标签 ID 归档标签。 */
+  async archiveTag(account: QianjiAccount, tagId: string): Promise<void> {
+    await this.authPost(account, "/tag/archivetag", { did: tagId });
+  }
+
+  /** 按给定 ID 顺序重排标签，`v` 使用 JSON 字符串 ID 数组。 */
+  async reorderTags(account: QianjiAccount, orderedIds: string[]): Promise<void> {
+    await this.authPost(account, "/tag/reordertag", { v: stringifyTagIdList(orderedIds, "标签") });
+  }
+
+  /** 按给定 ID 顺序重排标签组，`v` 使用 JSON 字符串 ID 数组。 */
+  async reorderTagGroups(account: QianjiAccount, orderedIds: string[]): Promise<void> {
+    await this.authPost(account, "/tag/reordergroup", { v: stringifyTagIdList(orderedIds, "标签组") });
   }
 
   /** 从钱迹增量同步协议读取一页数据。 */

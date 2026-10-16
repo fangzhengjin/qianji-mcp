@@ -16,18 +16,23 @@ import test from "./context.ts";
 
 const ADMIN_PAT = `mt_pat_${"a".repeat(43)}`;
 const BUSINESS_TOOLS = [
+  "archive_tags",
   "cancel_reimbursements",
   "check_category_deletion",
   "create_bills",
   "create_categories",
   "create_refund",
   "create_subcategories",
+  "create_tag_groups",
+  "create_tags",
   "create_transfer",
   "connect_qianji",
   "delete_bills",
   "delete_categories",
   "delete_reimbursement",
   "delete_refund",
+  "delete_tag_groups",
+  "delete_tags",
   "disconnect_qianji",
   "get_bill",
   "get_bill_statistics",
@@ -45,9 +50,12 @@ const BUSINESS_TOOLS = [
   "refresh_cache",
   "reimburse_bills",
   "reorder_categories",
+  "reorder_tag_groups",
+  "reorder_tags",
   "update_bills",
   "update_categories",
   "update_refund",
+  "update_tags",
   "update_transfer",
 ].sort();
 
@@ -848,7 +856,7 @@ test("普通 PAT 默认 legacy 可协商 2025-11-25", async (t) => {
   await client.connect(transport(app, token));
   assert.equal(client.getProtocolEra(), "legacy");
   assert.equal(client.getNegotiatedProtocolVersion(), "2025-11-25");
-  assert.equal((await client.listTools()).tools.length, 33);
+  assert.equal((await client.listTools()).tools.length, 41);
 });
 
 test("MCP 输入 schema 接受边界并在进入业务逻辑前拒绝越界字段", async (t) => {
@@ -1404,7 +1412,7 @@ test("get_bill 兼容上游省略 remark、assetId 和 updateTime", async (t) =>
   assert.equal("updateTime" in returned, false);
 });
 
-test("超级管理员 PAT 取得 33 个业务工具和 3 个 PAT 管理工具", async (t) => {
+test("超级管理员 PAT 取得 41 个业务工具和 3 个 PAT 管理工具", async (t) => {
   const { store, app, token } = setupApp({
     role: "admin",
     bound: true,

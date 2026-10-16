@@ -26,7 +26,14 @@ import {
   PARENT_ID_PATTERN,
   POSITIVE_ID_PATTERN,
 } from "./ids.ts";
-import { MAX_BILL_CURSOR_LENGTH, MAX_CATEGORY_NAME_LENGTH, MAX_MONEY, MAX_SEARCH_KEYWORD_LENGTH } from "./bill-rules.ts";
+import {
+  MAX_BILL_CURSOR_LENGTH,
+  MAX_CATEGORY_NAME_LENGTH,
+  MAX_MONEY,
+  MAX_SEARCH_KEYWORD_LENGTH,
+  MAX_TAG_NAME_LENGTH,
+  TAG_COLOR_PATTERN,
+} from "./bill-rules.ts";
 import { MoneyTrackService } from "./qianji-service.ts";
 import serverInstructions from "./server-instructions.md" with { type: "text" };
 
@@ -232,6 +239,14 @@ const categorySchema = z.object({
 });
 const categoryNameText = z.string().trim().min(1).max(MAX_CATEGORY_NAME_LENGTH)
   .describe("分类名称");
+const tagNameText = z.string().trim().min(1).max(MAX_TAG_NAME_LENGTH)
+  .describe("标签名称");
+const tagColorText = z.string().trim().regex(TAG_COLOR_PATTERN)
+  .describe("标签颜色，六位十六进制色值，如 \"ff0000\"");
+const createdTagGroupSchema = z.object({
+  groupId: opaqueIdText.describe("标签组 ID，不透明非空字符串"),
+  name: z.string().describe("标签组名称"),
+});
 const categoryIconSchema = z.object({
   group: z.string().describe("图标分组标识"),
   groupName: z.string().describe("图标分组名称"),
@@ -1380,6 +1395,160 @@ export function createMoneyTrackMcp(
     },
     async (_input, ctx) =>
       toolResult(async () => ({ results: await service.listCategoryIcons(await userId(principal, store)) }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "create_tag_groups",
+    {
+      description: "批量创建标签组",
+      inputSchema: z.strictObject({
+        groups: z.array(z.strictObject({
+          name: tagNameText,
+        })).min(1).max(100).describe("待创建标签组列表"),
+      }),
+      outputSchema: z.object({
+        groups: z.array(createdTagGroupSchema).describe("钱迹返回并确认的已创建标签组列表，顺序与输入一致"),
+      }),
+      annotations: writeAnnotations,
+    },
+    async ({ groups }, ctx) =>
+      toolResult(async () => service.createTagGroups(await userId(principal, store), groups), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "delete_tag_groups",
+    {
+      description: "批量永久删除标签组",
+      inputSchema: z.strictObject({
+        groupIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("要永久删除的标签组 ID 列表"),
+      }),
+      outputSchema: z.object({
+        deletedGroupIds: z.array(opaqueIdText).describe("已删除的标签组 ID 列表，顺序与输入一致"),
+      }),
+      annotations: destructiveAnnotations,
+    },
+    async ({ groupIds }, ctx) =>
+      toolResult(async () => service.deleteTagGroups(await userId(principal, store), groupIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "create_tags",
+    {
+      description: "批量创建标签，可挂到已有标签组下并指定颜色",
+      inputSchema: z.strictObject({
+        tags: z.array(z.strictObject({
+          name: tagNameText,
+          groupId: opaqueIdText.optional()
+            .describe("所属标签组 ID，省略时创建在默认组"),
+          color: tagColorText.optional()
+            .describe("标签颜色，六位十六进制色值，如 \"ff0000\""),
+        })).min(1).max(100).describe("待创建标签列表"),
+      }),
+      outputSchema: z.object({
+        tags: z.array(tagSchema).describe("钱迹返回并确认的已创建标签列表，顺序与输入一致"),
+      }),
+      annotations: writeAnnotations,
+    },
+    async ({ tags }, ctx) =>
+      toolResult(async () => service.createTags(await userId(principal, store), tags), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "update_tags",
+    {
+      description: "批量修改标签名称、所属组或颜色",
+      inputSchema: z.strictObject({
+        updates: z.array(z.strictObject({
+          tagId: opaqueIdText.describe("要修改的标签 ID"),
+          name: tagNameText.optional().describe("新的标签名称"),
+          groupId: opaqueIdText.optional()
+            .describe("新的所属标签组 ID"),
+          color: tagColorText.optional()
+            .describe("新的标签颜色，六位十六进制色值，如 \"ff0000\""),
+        })).min(1).max(100)
+          .describe("待修改标签列表，每项至少提供 name、groupId 或 color 之一"),
+      }),
+      outputSchema: z.object({
+        tags: z.array(z.object({
+          tagId: opaqueIdText.describe("已修改的标签 ID"),
+          name: z.string().optional().describe("修改后的标签名称"),
+          groupId: opaqueIdText.optional().describe("修改后的所属标签组 ID"),
+          color: tagColorText.optional().describe("修改后的标签颜色"),
+        })).describe("已修改的标签列表，顺序与输入一致"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ updates }, ctx) =>
+      toolResult(async () => service.updateTags(await userId(principal, store), updates), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "delete_tags",
+    {
+      description: "批量永久删除标签",
+      inputSchema: z.strictObject({
+        tagIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("要永久删除的标签 ID 列表"),
+      }),
+      outputSchema: z.object({
+        deletedTagIds: z.array(opaqueIdText).describe("已删除的标签 ID 列表，顺序与输入一致"),
+      }),
+      annotations: destructiveAnnotations,
+    },
+    async ({ tagIds }, ctx) =>
+      toolResult(async () => service.deleteTags(await userId(principal, store), tagIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "archive_tags",
+    {
+      description: "批量归档标签，归档后不再出现在正常标签列表中",
+      inputSchema: z.strictObject({
+        tagIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("要归档的标签 ID 列表"),
+      }),
+      outputSchema: z.object({
+        archivedTagIds: z.array(opaqueIdText).describe("已归档的标签 ID 列表，顺序与输入一致"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ tagIds }, ctx) =>
+      toolResult(async () => service.archiveTags(await userId(principal, store), tagIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "reorder_tags",
+    {
+      description: "按给定 ID 顺序重排标签的展示顺序",
+      inputSchema: z.strictObject({
+        orderedTagIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("按新顺序排列的标签 ID 列表"),
+      }),
+      outputSchema: z.object({
+        orderedTagIds: z.array(opaqueIdText).describe("按新顺序保存的标签 ID 列表"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ orderedTagIds }, ctx) =>
+      toolResult(async () => service.reorderTags(await userId(principal, store), orderedTagIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "reorder_tag_groups",
+    {
+      description: "按给定 ID 顺序重排标签组的展示顺序",
+      inputSchema: z.strictObject({
+        orderedGroupIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("按新顺序排列的标签组 ID 列表"),
+      }),
+      outputSchema: z.object({
+        orderedGroupIds: z.array(opaqueIdText).describe("按新顺序保存的标签组 ID 列表"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ orderedGroupIds }, ctx) =>
+      toolResult(async () => service.reorderTagGroups(await userId(principal, store), orderedGroupIds), ctx, principal, bindingTickets),
   );
 
   if (principal.role === "admin") registerAdminTools(server, store, principal, bindingTickets);

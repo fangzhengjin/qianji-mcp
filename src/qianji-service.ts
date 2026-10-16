@@ -17,6 +17,10 @@ import {
   normalizeCategoryName,
   normalizeCategoryParentId,
   normalizeRequiredAssetId,
+  normalizeTagColor,
+  normalizeTagGroupId,
+  normalizeTagId,
+  normalizeTagName,
   patchWasApplied,
   refundPatchApplied,
   refundPayload,
@@ -79,6 +83,8 @@ import {
   publicCategoryIconGroup,
   publicCurrencyConversion,
   publicDebtAccount,
+  publicTag,
+  publicTagGroup,
   publicTagGroups,
 } from "./qianji-mappers.ts";
 import { QianjiClient, type BudgetPeriod, type PullPage, type SyncBillResult } from "./qianji-client.ts";
@@ -159,6 +165,23 @@ export interface CategoryDeletionInput {
   categoryId: ReferenceIdInput;
   transferTo?: ReferenceIdInput;
   deleteBills?: boolean;
+}
+
+export interface TagGroupCreateInput {
+  name: string;
+}
+
+export interface TagCreateInput {
+  name: string;
+  groupId?: string;
+  color?: string;
+}
+
+export interface TagUpdateInput {
+  tagId: string;
+  name?: string;
+  groupId?: string;
+  color?: string;
 }
 
 export interface CreateMultipleCategoriesInput {
@@ -518,6 +541,190 @@ export class MoneyTrackService {
       const tags = await this.loadTags(account);
       return publicTagGroups(tags.filter((tag) => status === -1 || Number(tag.status ?? 1) === status));
     });
+  }
+
+  /** 一次提交创建一个或多个标签组，写入后使本地标签快照失效。 */
+  async createTagGroups(
+    accountId: number,
+    groups: TagGroupCreateInput[],
+  ): Promise<{ groups: Record<string, unknown>[] }> {
+    if (groups.length === 0) throw new AppError("INVALID_TAG_GROUPS", "groups 不能为空");
+    const names = groups.map(({ name }) => normalizeTagName(name));
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        const created: Record<string, unknown>[] = [];
+        for (const name of names) {
+          const group = await this.client.createTagGroup(account, name);
+          markRemoteSuccess();
+          if (group) created.push(publicTagGroup(group));
+        }
+        await this.invalidateAllTagCaches(account.id);
+        return { groups: created };
+      }),
+    );
+  }
+
+  /** 一次提交批量删除标签组，写入后使本地标签快照失效。 */
+  async deleteTagGroups(
+    accountId: number,
+    groupIds: string[],
+  ): Promise<{ deletedGroupIds: string[] }> {
+    if (groupIds.length === 0) throw new AppError("INVALID_TAG_GROUP_DELETIONS", "groupIds 不能为空");
+    const ids = groupIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("INVALID_TAG_GROUP_DELETIONS", "groupIds 不能包含重复 ID");
+    }
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        for (const groupId of ids) {
+          await this.client.deleteTagGroup(account, groupId);
+          markRemoteSuccess();
+        }
+        await this.invalidateAllTagCaches(account.id);
+        return { deletedGroupIds: ids };
+      }),
+    );
+  }
+
+  /** 一次提交创建一个或多个标签，写入后使本地标签快照失效。 */
+  async createTags(
+    accountId: number,
+    tags: TagCreateInput[],
+  ): Promise<{ tags: Record<string, unknown>[] }> {
+    if (tags.length === 0) throw new AppError("INVALID_TAGS", "tags 不能为空");
+    const normalized = tags.map((tag) => ({
+      name: normalizeTagName(tag.name),
+      groupId: tag.groupId === undefined ? undefined : normalizeTagGroupId(tag.groupId),
+      color: normalizeTagColor(tag.color),
+    }));
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        const created: Record<string, unknown>[] = [];
+        for (const tag of normalized) {
+          const result = await this.client.createTag(account, tag);
+          markRemoteSuccess();
+          if (result) created.push(publicTag(result));
+        }
+        await this.invalidateAllTagCaches(account.id);
+        return { tags: created };
+      }),
+    );
+  }
+
+  /** 一次提交批量修改标签名称、所属组或颜色，写入后使本地标签快照失效。 */
+  async updateTags(
+    accountId: number,
+    updates: TagUpdateInput[],
+  ): Promise<{ tags: Array<{ tagId: string; name?: string; groupId?: string; color?: string }> }> {
+    if (updates.length === 0) throw new AppError("INVALID_TAG_UPDATES", "updates 不能为空");
+    const ids = updates.map(({ tagId }) => normalizeTagId(tagId));
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_UPDATES", "updates 不能包含重复 tagId");
+    const normalized = updates.map((update, index) => {
+      if (update.name === undefined && update.groupId === undefined && update.color === undefined) {
+        throw new AppError("INVALID_TAG_UPDATES", "updates 每项至少提供 name、groupId 或 color 之一");
+      }
+      return {
+        tagId: ids[index]!,
+        name: update.name === undefined ? undefined : normalizeTagName(update.name),
+        groupId: update.groupId === undefined ? undefined : normalizeTagGroupId(update.groupId),
+        color: normalizeTagColor(update.color),
+      };
+    });
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        const tags: Array<{ tagId: string; name?: string; groupId?: string; color?: string }> = [];
+        for (const update of normalized) {
+          await this.client.updateTag(account, update.tagId, {
+            name: update.name,
+            groupId: update.groupId,
+            color: update.color,
+          });
+          markRemoteSuccess();
+          tags.push({
+            tagId: update.tagId,
+            ...(update.name !== undefined ? { name: update.name } : {}),
+            ...(update.groupId !== undefined ? { groupId: update.groupId } : {}),
+            ...(update.color !== undefined ? { color: update.color } : {}),
+          });
+        }
+        await this.invalidateAllTagCaches(account.id);
+        return { tags };
+      }),
+    );
+  }
+
+  /** 一次提交批量删除标签，写入后使本地标签快照失效。 */
+  async deleteTags(accountId: number, tagIds: string[]): Promise<{ deletedTagIds: string[] }> {
+    if (tagIds.length === 0) throw new AppError("INVALID_TAG_DELETIONS", "tagIds 不能为空");
+    const ids = tagIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_DELETIONS", "tagIds 不能包含重复 ID");
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        for (const tagId of ids) {
+          await this.client.deleteTag(account, tagId);
+          markRemoteSuccess();
+        }
+        await this.invalidateAllTagCaches(account.id);
+        return { deletedTagIds: ids };
+      }),
+    );
+  }
+
+  /** 一次提交批量归档标签，写入后使本地标签快照失效。 */
+  async archiveTags(accountId: number, tagIds: string[]): Promise<{ archivedTagIds: string[] }> {
+    if (tagIds.length === 0) throw new AppError("INVALID_TAG_ARCHIVES", "tagIds 不能为空");
+    const ids = tagIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_ARCHIVES", "tagIds 不能包含重复 ID");
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        for (const tagId of ids) {
+          await this.client.archiveTag(account, tagId);
+          markRemoteSuccess();
+        }
+        await this.invalidateAllTagCaches(account.id);
+        return { archivedTagIds: ids };
+      }),
+    );
+  }
+
+  /** 按给定 ID 顺序重排标签，写入后使本地标签快照失效。 */
+  async reorderTags(
+    accountId: number,
+    orderedTagIds: string[],
+  ): Promise<{ orderedTagIds: string[] }> {
+    if (orderedTagIds.length === 0) throw new AppError("INVALID_TAG_ORDER", "orderedTagIds 不能为空");
+    const ids = orderedTagIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("INVALID_TAG_ORDER", "orderedTagIds 不能包含重复 ID");
+    }
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        await this.client.reorderTags(account, ids);
+        markRemoteSuccess();
+        await this.invalidateAllTagCaches(account.id);
+        return { orderedTagIds: ids };
+      }),
+    );
+  }
+
+  /** 按给定 ID 顺序重排标签组，写入后使本地标签快照失效。 */
+  async reorderTagGroups(
+    accountId: number,
+    orderedGroupIds: string[],
+  ): Promise<{ orderedGroupIds: string[] }> {
+    if (orderedGroupIds.length === 0) throw new AppError("INVALID_TAG_GROUP_ORDER", "orderedGroupIds 不能为空");
+    const ids = orderedGroupIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("INVALID_TAG_GROUP_ORDER", "orderedGroupIds 不能包含重复 ID");
+    }
+    return this.withBillAccount(accountId, async (account) =>
+      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        await this.client.reorderTagGroups(account, ids);
+        markRemoteSuccess();
+        await this.invalidateAllTagCaches(account.id);
+        return { orderedGroupIds: ids };
+      }),
+    );
   }
 
   /** 强制刷新当前账号的用户、账单及全部目录快照。 */
@@ -2062,6 +2269,11 @@ export class MoneyTrackService {
     for (const book of books?.data ?? []) {
       await this.store.invalidateCatalogCache(accountId, "categories", String(book.bookid));
     }
+  }
+
+  /** 标签写入后使账号的标签快照失效。 */
+  private async invalidateAllTagCaches(accountId: number): Promise<void> {
+    await this.store.invalidateCatalogCache(accountId, "tags", "");
   }
 
   /** 读取包含正常和归档标签的完整目录。 */
