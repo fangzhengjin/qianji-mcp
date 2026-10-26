@@ -15,8 +15,9 @@ import { decimalSubtract } from "./decimal.ts";
 import { AppError } from "./errors.ts";
 import { isCurrencySymbol, isParentLongId, isPositiveLongId } from "./ids.ts";
 import { isRawJsonNumber, parseQianjiJson } from "./qianji-client.ts";
+import { DEFAULT_TIME_ZONE, zoneCalendarParts, zoneDayEpoch, zoneDayStart } from "./time.ts";
 
-/** 将数据库账单投影为列表接口使用的精简结构。 */
+/** 将数据库账单投影为列表接口使用的精简结构 */
 export function billSummary(row: BillRow): Record<string, unknown> {
   const raw = parseQianjiJson(row.rawJson) as Record<string, unknown>;
   const summary: Record<string, unknown> = {
@@ -34,7 +35,7 @@ export function billSummary(row: BillRow): Record<string, unknown> {
   return summary;
 }
 
-/** 将钱迹账本转换为稳定的公开字段。 */
+/** 将钱迹账本转换为稳定的公开字段 */
 export function publicBook(book: Record<string, unknown>): Record<string, unknown> {
   return {
     bookId: book.bookid,
@@ -46,7 +47,7 @@ export function publicBook(book: Record<string, unknown>): Record<string, unknow
   };
 }
 
-/** 按 APK 规则读取资产币种，原始值为空时使用账号本位币。 */
+/** 按 APK 规则读取资产币种，原始值为空时使用账号本位币 */
 export function publicAssetCurrency(asset: Record<string, unknown>, baseCurrency: string): string {
   const currency = String(asset.currency ?? "").trim() || baseCurrency;
   if (!isCurrencySymbol(currency)) {
@@ -55,8 +56,8 @@ export function publicAssetCurrency(asset: Record<string, unknown>, baseCurrency
   return currency;
 }
 
-/** 将钱迹资产转换为稳定的公开字段。 */
-function publicAsset(asset: Record<string, unknown>, includeBalances: boolean, baseCurrency: string, nowMs: number): Record<string, unknown> {
+/** 将钱迹资产转换为稳定的公开字段 */
+function publicAsset(asset: Record<string, unknown>, includeBalances: boolean, baseCurrency: string, nowMs: number, timeZone: string): Record<string, unknown> {
   const result: Record<string, unknown> = {
     id: asset.id,
     name: String(asset.name ?? ""),
@@ -86,7 +87,7 @@ function publicAsset(asset: Record<string, unknown>, includeBalances: boolean, b
         type: daysAfterStatement ? "daysAfterStatement" : "dayOfMonth",
         value: repaymentDay,
       };
-      const next = nextCreditRepaymentDate(nowMs, statementDay, repaymentDay, daysAfterStatement);
+      const next = nextCreditRepaymentDate(nowMs, statementDay, repaymentDay, daysAfterStatement, timeZone);
       if (next !== undefined) creditResult.nextRepaymentDate = next;
     }
     const limit = Number(value.limit);
@@ -96,12 +97,13 @@ function publicAsset(asset: Record<string, unknown>, includeBalances: boolean, b
   return result;
 }
 
-/** 按自定义分组或资产类型组织公开资产列表。 */
+/** 按自定义分组或资产类型组织公开资产列表 */
 export function publicAssetGroups(
   assets: Record<string, unknown>[],
   includeBalances: boolean,
   baseCurrency: string,
   nowMs = Date.now(),
+  timeZone = DEFAULT_TIME_ZONE,
 ): Record<string, unknown>[] {
   const custom = new Map<string, { name: string; order: number; children: Record<string, unknown>[] }>();
   const defaults = new Map<number, { name: string; children: Record<string, unknown>[] }>();
@@ -113,13 +115,13 @@ export function publicAssetGroups(
         order: Number(asset.groupOrder ?? Number.MAX_SAFE_INTEGER),
         children: [],
       };
-      group.children.push(publicAsset(asset, includeBalances, baseCurrency, nowMs));
+      group.children.push(publicAsset(asset, includeBalances, baseCurrency, nowMs, timeZone));
       custom.set(groupId, group);
       continue;
     }
     const type = Number(asset.type ?? 0);
     const group = defaults.get(type) ?? { name: assetTypeName(type), children: [] };
-    group.children.push(publicAsset(asset, includeBalances, baseCurrency, nowMs));
+    group.children.push(publicAsset(asset, includeBalances, baseCurrency, nowMs, timeZone));
     defaults.set(type, group);
   }
   return [
@@ -128,7 +130,7 @@ export function publicAssetGroups(
   ].map(({ name, children }) => ({ name, children }));
 }
 
-/** 将钱迹独立借入或借出详情转换为查询所需的稳定字段。 */
+/** 将钱迹独立借入或借出详情转换为查询所需的稳定字段 */
 export function publicDebtAccount(asset: Record<string, unknown>, baseCurrency: string): Record<string, unknown> {
   if (!asset.loan || typeof asset.loan !== "object" || Array.isArray(asset.loan)) {
     throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹借入或借出详情缺少必要信息", 502);
@@ -166,12 +168,12 @@ export function publicDebtAccount(asset: Record<string, unknown>, baseCurrency: 
   return result;
 }
 
-/** 将钱迹资产类型代码映射为默认分组名称。 */
+/** 将钱迹资产类型代码映射为默认分组名称 */
 function assetTypeName(type: number): string {
   return ({ 1: "资金", 2: "信用卡", 3: "充值", 4: "投资", 5: "债务记录", 6: "债务", 7: "社会保障" } as Record<number, string>)[type] ?? "其它";
 }
 
-/** 将单个分类转换为公开字段。 */
+/** 将单个分类转换为公开字段 */
 function publicCategoryItem(category: Record<string, unknown>): Record<string, unknown> {
   return {
     id: publicCategoryId(category.id ?? category.cateid),
@@ -182,33 +184,33 @@ function publicCategoryItem(category: Record<string, unknown>): Record<string, u
   };
 }
 
-/** 将一级分类及其直属子分类转换为公开结构。 */
+/** 将一级分类及其直属子分类转换为公开结构 */
 export function publicCategory(category: Record<string, unknown>): Record<string, unknown> {
   return { ...publicCategoryItem(category), children: categoryChildren(category).map(publicCategoryItem) };
 }
 
-/** 安全读取分类的直属子分类列表。 */
+/** 安全读取分类的直属子分类列表 */
 export function categoryChildren(category: Record<string, unknown>): Record<string, unknown>[] {
   return Array.isArray(category.sublist)
     ? category.sublist.filter((child): child is Record<string, unknown> => Boolean(child) && typeof child === "object" && !Array.isArray(child))
     : [];
 }
 
-/** 校验并输出钱迹分类 ID。 */
+/** 校验并输出钱迹分类 ID */
 function publicCategoryId(value: unknown): string {
   const text = isRawJsonNumber(value) ? JSON.stringify(value) : String(value);
   if (!isPositiveLongId(text)) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹分类包含无效 ID", 502);
   return text;
 }
 
-/** 校验并输出允许哨兵值的父分类 ID。 */
+/** 校验并输出允许哨兵值的父分类 ID */
 function publicCategoryParentId(value: unknown): string {
   const text = isRawJsonNumber(value) ? JSON.stringify(value) : String(value);
   if (!isParentLongId(text)) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹分类包含无效父分类 ID", 502);
   return text;
 }
 
-/** 将钱迹标签转换为稳定的公开字段。 */
+/** 将钱迹标签转换为稳定的公开字段 */
 function publicTag(tag: Record<string, unknown>): Record<string, unknown> {
   return {
     id: String(tag.id),
@@ -217,7 +219,7 @@ function publicTag(tag: Record<string, unknown>): Record<string, unknown> {
   };
 }
 
-/** 按钱迹标签组组织公开标签列表。 */
+/** 按钱迹标签组组织公开标签列表 */
 export function publicTagGroups(tags: Record<string, unknown>[]): Record<string, unknown>[] {
   const groups = new Map<string, { groupId: string; name: string; children: Record<string, unknown>[] }>();
   for (const tag of tags) {
@@ -229,7 +231,7 @@ export function publicTagGroups(tags: Record<string, unknown>[]): Record<string,
   return [...groups.values()];
 }
 
-/** 从数据库行恢复用于完整读取和更新的钱迹账单对象。 */
+/** 从数据库行恢复用于完整读取和更新的钱迹账单对象 */
 export function cachedBillObject(row: BillRow): Record<string, unknown> {
   const raw = parseQianjiJson(row.rawJson) as Record<string, unknown>;
   raw.remark ??= row.remark;
@@ -237,7 +239,7 @@ export function cachedBillObject(row: BillRow): Record<string, unknown> {
   return raw;
 }
 
-/** 将完整钱迹账单转换为受控的公开字段。 */
+/** 将完整钱迹账单转换为受控的公开字段 */
 export function publicBill(raw: Record<string, unknown>): Record<string, unknown> {
   const bill: Record<string, unknown> = {
     id: publicBillId("id", raw.id),
@@ -263,7 +265,7 @@ export function publicBill(raw: Record<string, unknown>): Record<string, unknown
   return bill;
 }
 
-/** 补齐账单摘要和详情共用的公开字段。 */
+/** 补齐账单摘要和详情共用的公开字段 */
 function addSharedBillFields(output: Record<string, unknown>, raw: Record<string, unknown>): void {
   addOptionalAssetReference(output, "fromId", raw.fromid);
   addOptionalAssetReference(output, "targetId", raw.targetid);
@@ -275,12 +277,12 @@ function addSharedBillFields(output: Record<string, unknown>, raw: Record<string
   addBillRelationships(output, raw);
 }
 
-/** 返回账单保存时的跨币种金额，不使用当前价格重算历史记录。 */
+/** 返回账单保存时的跨币种金额，不使用当前价格重算历史记录 */
 export function publicCurrencyConversion(raw: Record<string, unknown>): Record<string, unknown> | undefined {
   return validatedCurrencyConversion(raw);
 }
 
-/** 按账单类型公开手续费和优惠，避免错误解释其他业务类型的 `transfee`。 */
+/** 按账单类型公开手续费和优惠，避免错误解释其他业务类型的 `transfee` */
 function addBillAdjustment(output: Record<string, unknown>, raw: Record<string, unknown>): void {
   const type = Number(raw.type);
   if (![0, 2, 3, 5].includes(type)) return;
@@ -289,7 +291,7 @@ function addBillAdjustment(output: Record<string, unknown>, raw: Record<string, 
   if ([2, 3].includes(type)) output.fee = adjustment > 0 ? adjustment : 0;
 }
 
-/** 公开记账人和账单来源，避免调用方读取上游内部字段。 */
+/** 公开记账人和账单来源，避免调用方读取上游内部字段 */
 function addBillAttribution(output: Record<string, unknown>, raw: Record<string, unknown>): void {
   output.createdBy = {
     userId: publicUserId(raw.userid),
@@ -308,7 +310,7 @@ function billSourceName(code: number, raw: Record<string, unknown>): string {
   return "unknown";
 }
 
-/** 将退款和报销关系转换为公开账单 ID 字段。 */
+/** 将退款和报销关系转换为公开账单 ID 字段 */
 function addBillRelationships(output: Record<string, unknown>, raw: Record<string, unknown>): void {
   const extra = billExtra(raw);
   const refunds = refundRelationshipMap(raw);
@@ -342,13 +344,13 @@ function addBillRelationships(output: Record<string, unknown>, raw: Record<strin
   }
 }
 
-/** 将 APK 内部空资产哨兵收口为公开 null。 */
+/** 将 APK 内部空资产哨兵收口为公开 null */
 function publicOptionalAssetId(value: unknown): string | null {
   if (value === undefined || value === null || String(value) === "-1") return null;
   return publicBillId("assetId", value);
 }
 
-/** 只在存在真实资产引用时公开来源或目标资产。 */
+/** 只在存在真实资产引用时公开来源或目标资产 */
 function addOptionalAssetReference(output: Record<string, unknown>, field: "fromId" | "targetId", value: unknown): void {
   if (value === undefined || value === null || String(value) === "-1") return;
   output[field] = publicBillId(field, value);
@@ -359,27 +361,28 @@ function nextCreditRepaymentDate(
   statementDay: number,
   repaymentDay: number,
   daysAfterStatement: boolean,
+  timeZone: string,
 ): number | undefined {
   if (daysAfterStatement && (!Number.isInteger(statementDay) || statementDay <= 0)) return undefined;
-  const offsetMs = 8 * 60 * 60 * 1000;
-  const localNow = new Date(nowMs + offsetMs);
-  const today = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate());
+  const now = Math.floor(nowMs / 1000);
+  const today = zoneDayStart(now, timeZone);
+  const { year, month } = zoneCalendarParts(now, timeZone);
   let candidate: number;
   if (!daysAfterStatement) {
-    candidate = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), repaymentDay);
-    if (candidate < today) candidate = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth() + 1, repaymentDay);
+    candidate = zoneDayEpoch(year, month, repaymentDay, timeZone);
+    if (candidate < today) candidate = zoneDayEpoch(year, month + 1, repaymentDay, timeZone);
   } else {
-    let cycleMonth = localNow.getUTCMonth() - 1;
-    candidate = Date.UTC(localNow.getUTCFullYear(), cycleMonth, statementDay + repaymentDay);
+    let cycleMonth = month - 1;
+    candidate = zoneDayEpoch(year, cycleMonth, statementDay + repaymentDay, timeZone);
     while (candidate < today) {
       cycleMonth += 1;
-      candidate = Date.UTC(localNow.getUTCFullYear(), cycleMonth, statementDay + repaymentDay);
+      candidate = zoneDayEpoch(year, cycleMonth, statementDay + repaymentDay, timeZone);
     }
   }
-  return Math.floor((candidate - offsetMs) / 1000);
+  return candidate;
 }
 
-/** 将官方原始金额还原为 APP 主金额输入框语义。 */
+/** 将官方原始金额还原为 APP 主金额输入框语义 */
 function publicMoney(raw: Record<string, unknown>): number {
   const conversion = publicCurrencyConversion(raw);
   if (conversion) return Number(conversion.sourceAmount);
@@ -388,7 +391,7 @@ function publicMoney(raw: Record<string, unknown>): number {
     : Number(raw.money);
 }
 
-/** 将钱迹内部统计位值转换为与 APP 一致的两个开关。 */
+/** 将钱迹内部统计位值转换为与 APP 一致的两个开关 */
 function addBillFlag(output: Record<string, unknown>, raw: Record<string, unknown>): void {
   const rawFlag = billExtra(raw).flag;
   const flag = rawFlag === undefined || rawFlag === null || rawFlag === "" ? 0 : Number(rawFlag);

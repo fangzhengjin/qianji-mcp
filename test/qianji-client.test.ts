@@ -66,7 +66,7 @@ test("JSON 解析和序列化不丢失 64 位业务 ID", () => {
 });
 
 test("钱迹账单的 assetId、fromId 和 targetId 拒绝 0", async () => {
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
   for (const field of ["assetid", "fromid", "targetid"] as const) {
     const change = {
       id: 1,
@@ -154,6 +154,24 @@ test("统一 Client 使用 Android 4.5.1b3 公共头并直接转发登录密码 
   assert.equal(captured?.body.toString().includes("plain-password"), false);
 });
 
+test("账号设置时区后 timezoneoffset 头按该时区当刻偏移上报", async () => {
+  const capturedOffsets: string[] = [];
+  const client = new QianjiClient({
+    // 2026-07-26（北半球夏令时期间），纽约为 -04:00
+    now: () => Date.UTC(2026, 6, 26, 12),
+    fetch: async (_input, init) => {
+      capturedOffsets.push(new Headers(init?.headers).get("timezoneoffset") ?? "");
+      return Response.json({ ec: 200, em: "", data: { list: [] } });
+    },
+  });
+  await client.listTags({ id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "America/New_York" } as QianjiAccount, 1, 0);
+  assert.deepEqual(capturedOffsets, ["-14400"]);
+
+  capturedOffsets.length = 0;
+  await client.listTags({ id: 1, uid: "u", utoken: "t", devid: "d" } as QianjiAccount, 1, 0);
+  assert.deepEqual(capturedOffsets, ["28800"]);
+});
+
 test("同一路径同一毫秒的请求使用不同 reqidv2", async () => {
   const reqids: string[] = [];
   const client = new QianjiClient({
@@ -163,7 +181,7 @@ test("同一路径同一毫秒的请求使用不同 reqidv2", async () => {
       return Response.json({ ec: 200, data: { list: [] } });
     },
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   await client.listAssets(account, true);
 
@@ -181,7 +199,7 @@ test("资产列表保留上游自定义分组元数据", async () => {
       ],
     } }),
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   assert.deepEqual(await client.listAssets(account, false), [
     { id: "1", name: "现金", type: 1, status: 0, groupid: "group-1", groupName: "常用", groupOrder: 0 },
@@ -196,7 +214,7 @@ test("分类 parentId 的上游 0 兼容值输出为字符串", async () => {
       data: { list: [{ id: 1, name: "root", type: 0, level: 1, parentid: 0 }] },
     }),
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   const categories = await client.listCategories(account, "1", 0);
 
@@ -214,7 +232,7 @@ test("预算列表按 APK 月年筛选格式请求并规范化业务 ID", async 
       ] } });
     },
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   const monthly = await client.listBudgets(account, "1", { kind: "month", year: 2026, month: 8 }, "m15");
   await client.listBudgets(account, "1", { kind: "year", year: 2026 });
@@ -239,7 +257,7 @@ test("账本成员查询按独立接口返回筛选所需字段", async () => {
       return new Response('{"ec":200,"data":{"list":[{"id":1770000000000000001,"name":"成员","avatar":"ignored"}]}}');
     },
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   assert.deepEqual(await client.listBookMembers(account, "1"), [
     { userId: "1770000000000000001", name: "成员" },
@@ -259,7 +277,7 @@ test("标签按 TagGroup 展平并保留非数字 ID、默认组和组名", asyn
       ] } });
     },
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   assert.deepEqual(await client.listTags(account, -1, 123), [
     { id: "tag.alpha", name: "Alpha", status: 1, groupId: "", groupName: "默认组" },
@@ -274,7 +292,7 @@ test("币种目录保留 APK 返回的字符串标识", async () => {
       list: [{ symbol: "usdt", baseprice: 7.1, pricetime: 1_770_000_000 }],
     } }),
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   assert.deepEqual(await client.listCurrencies(account), [
     { symbol: "usdt", baseprice: 7.1, pricetime: 1_770_000_000 },
@@ -293,7 +311,7 @@ test("client/init 使用 APK 已确认参数，并为省略的币种配置应用
       } });
     },
   });
-  const account: QianjiAccount = { id: 1, uid: "uid-1", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "uid-1", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   const result = await (client as unknown as {
     initialize(account: QianjiAccount, currentIsVip: boolean): Promise<unknown>;
@@ -331,7 +349,7 @@ test("pull 保留分类失效信号和复杂账单关系 ID", async () => {
       `{"ec":200,"data":{"changes":[{"id":${refundId},"bookid":1,"time":1770000000,"type":20,"money":1,"extra":{"refundsid":${sourceId}}}],"deletes":[],"categories":[{"id":2,"bookid":1}],"bookid":1,"pageoffset":0,"hasmore":0,"pagesign":"","lasttimes":{"cursor":1}}}`,
     ),
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   const page = await client.pullBills(account, { bookid: "-1", pageoffset: 0, pagesign: "" });
   assert.deepEqual(page.categories, [{ id: "2", bookid: "1" }]);
@@ -421,7 +439,7 @@ test("新版报销未迁移时返回可识别的账号迁移错误", async () =>
   });
   await assert.rejects(
     () => client.reimburseBills(
-      { id: 1, uid: "u", utoken: "t", devid: "d" },
+      { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" },
       { allocations: { "1770000000000000001": { money: 1 } } },
     ),
     (error: unknown) => error instanceof AppError &&
@@ -451,7 +469,7 @@ test("创建、修改、删除 syncall 请求结构 fixture 保持精确", async
       });
     },
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
   const id = "1770000000000123456";
   const fullBill = {
     id,
@@ -531,7 +549,7 @@ test("退款、报销迁移、报销和取消报销请求结构与 APK 证据一
       return Response.json({ ec: 200, data: {} });
     },
   });
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   const refund = await client.refundBill(account, sourceId, {
     money: 3,
@@ -588,7 +606,7 @@ test("退款、报销迁移、报销和取消报销请求结构与 APK 证据一
 });
 
 test("新版报销迁移只接受 APK 的成功值 1", async () => {
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
   for (const data of [0, { v: 0 }, { v: 1, extra: true }]) {
     const client = new QianjiClient({ fetch: async () => Response.json({ ec: 200, data }) });
     await assert.rejects(
@@ -599,7 +617,7 @@ test("新版报销迁移只接受 APK 的成功值 1", async () => {
 });
 
 test("退款响应缺少 APK 要求的 data.list 数组时拒绝", async () => {
-  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d" };
+  const account: QianjiAccount = { id: 1, uid: "u", utoken: "t", devid: "d", timeZone: "Asia/Shanghai" };
 
   for (const data of [{}, { list: {} }]) {
     const client = new QianjiClient({ fetch: async () => Response.json({ ec: 200, data }) });

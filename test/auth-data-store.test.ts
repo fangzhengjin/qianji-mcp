@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 
 import { authenticatePat, requireAccountPrincipal, requireAdmin } from "../src/auth.ts";
 import { Store } from "../src/data-store.ts";
+import { AppError } from "../src/errors.ts";
 import { QianjiClient, md5 } from "../src/qianji-client.ts";
 import { MoneyTrackService } from "../src/qianji-service.ts";
 import test from "./context.ts";
@@ -143,7 +144,7 @@ test("绑定只保存 uid、utoken、devid，不保存密码或 MD5", async (t) 
     },
   });
   const service = new MoneyTrackService(store, client);
-  await service.bindAccount(pat.id, "login-name", passwordMd5);
+  await service.bindAccount(pat.id, "login-name", passwordMd5, "America/New_York");
   await service.close();
 
   const accountId = store.verifyPat(pat.token)?.accountId;
@@ -151,6 +152,7 @@ test("绑定只保存 uid、utoken、devid，不保存密码或 MD5", async (t) 
   const account = store.requireAccount(accountId!);
   assert.equal(account.uid, "money-user");
   assert.equal(account.utoken, "upstream-token");
+  assert.equal(account.timeZone, "America/New_York");
   assert.equal(store.getUserCache(account.id)?.data.name, "登录用户");
   assert.equal(store.getCatalogCache(account.id, "books")?.data[0]?.bookid, "-1");
   assert.match(account.devid, /^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/);
@@ -162,6 +164,22 @@ test("绑定只保存 uid、utoken、devid，不保存密码或 MD5", async (t) 
   assert.equal(columns.some(({ name }) => name === "password" || name === "password_md5"), false);
   assert.equal(persisted.includes(password), false);
   assert.equal(persisted.includes(passwordMd5), false);
+});
+
+test("绑定提交无效时区在进入登录流程前拒绝", async (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const pat = store.createPat("无效时区测试", null);
+  const client = new QianjiClient({
+    fetch: async () => { throw new Error("unexpected upstream call"); },
+  });
+  const service = new MoneyTrackService(store, client);
+  await assert.rejects(
+    service.bindAccount(pat.id, "login-name", md5("any-password"), "Mars/Olympus"),
+    (error) => error instanceof AppError && error.code === "INVALID_TIME_ZONE",
+  );
+  await service.close();
+  assert.equal(store.verifyPat(pat.token)?.accountId, null);
 });
 
 test("所有账单读取都按 account_id 隔离", (t) => {
@@ -185,6 +203,8 @@ test("所有账单读取都按 account_id 隔离", (t) => {
 
   assert.equal(store.getBill(account1.id, String(bill.id))?.remark, "tenant-one");
   assert.equal(store.getBill(account2.id, String(bill.id)), undefined);
+  assert.equal(store.getBills(account1.id, [String(bill.id)]).length, 1);
+  assert.equal(store.getBills(account2.id, [String(bill.id)]).length, 0);
   assert.equal(store.listBills(account2.id, { limit: 20 }).length, 0);
 });
 
@@ -407,6 +427,7 @@ test("旧 accounts 表升级后具备登录标识、用户缓存与 UID 共享�
     "write_quota_date",
     "write_quota_used",
     "login_identifier",
+    "timezone",
   ]);
   const row = migrated.db.prepare(`
     SELECT user_json, user_refreshed_at_ms, write_quota_date, write_quota_used, login_identifier

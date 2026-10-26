@@ -3,6 +3,7 @@ import type { BillRow } from "./data-store.ts";
 import { decimalAdd, decimalDivide, decimalMultiply, decimalRound, decimalSubtract } from "./decimal.ts";
 import { AppError } from "./errors.ts";
 import { cachedBillObject, categoryChildren, publicCurrencyConversion } from "./qianji-mappers.ts";
+import { DEFAULT_TIME_ZONE, zoneDayStart, zoneOffsetSeconds, zonePeriodKey } from "./time.ts";
 
 export type StatisticsUnit = "day" | "month" | "year";
 
@@ -20,6 +21,7 @@ export interface StatisticsOptions {
   tagMatch?: "any" | "all";
   categoryIds?: string[];
   nowMs: number;
+  timeZone?: string;
 }
 
 interface StatItem {
@@ -69,8 +71,9 @@ const EMPTY_ITEM: StatItem = {
   excludedBudget: 0,
 };
 
-/** 按 APK `BillStatItem/processStat` 的固定主报表语义计算公开统计结构。 */
+/** 按 APK `BillStatItem/processStat` 的固定主报表语义计算公开统计结构 */
 export function calculateBillStatistics(options: StatisticsOptions): Record<string, unknown> {
+  const timeZone = options.timeZone ?? DEFAULT_TIME_ZONE;
   const rawById = new Map(options.allRows.map((row) => [row.id, cachedBillObject(row)]));
   const candidates = options.rows.map((row) => ({ row, raw: rawById.get(row.id)! })).filter(({ row, raw }) =>
     (!options.memberIds || options.memberIds.includes(publicUserId(raw.userid))) &&
@@ -107,7 +110,7 @@ export function calculateBillStatistics(options: StatisticsOptions): Record<stri
     member.income = decimalAdd(member.income, item.income);
     member.spend = decimalAdd(member.spend, item.spend);
     members.set(userId, member);
-    const period = periodKey(row.time, options.unit);
+    const period = zonePeriodKey(row.time, options.unit, timeZone);
     const time = periods.get(period) ?? { income: 0, spend: 0 };
     time.income = decimalAdd(time.income, item.income);
     time.spend = decimalAdd(time.spend, item.spend);
@@ -135,7 +138,7 @@ export function calculateBillStatistics(options: StatisticsOptions): Record<stri
     range: {
       startTime: options.startTime,
       endTime: options.endTime,
-      timezoneOffsetSeconds: 28_800,
+      timezoneOffsetSeconds: zoneOffsetSeconds(timeZone, Math.floor(options.nowMs / 1000)),
     },
     currency,
     availableCurrencies: [...availableCurrencies].sort(),
@@ -176,7 +179,7 @@ export function calculateBillStatistics(options: StatisticsOptions): Record<stri
   };
 }
 
-/** 复用 APK `BillStatItem.fromBill(..., true, ...)` 的金额语义计算预算支出。 */
+/** 复用 APK `BillStatItem.fromBill(..., true, ...)` 的金额语义计算预算支出 */
 export function calculateBudgetBillAmounts(
   raw: Record<string, unknown>,
   currency: string,
@@ -393,18 +396,14 @@ function publicCategories(values: Map<string, CategoryValue>, total: number): Re
   return [...values.values()].sort((a, b) => b.amount - a.amount).map(convert);
 }
 
-function periodKey(epochSeconds: number, unit: StatisticsUnit): string {
-  const date = new Date(epochSeconds * 1000 + 8 * 60 * 60 * 1000);
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-  return unit === "year" ? String(year) : unit === "month" ? `${year}-${month}` : `${year}-${month}-${String(date.getUTCDate()).padStart(2, "0")}`;
-}
-
 function averagePeriodCount(options: StatisticsOptions, periods: Map<string, unknown>): number {
   if (options.unit !== "day") return periods.size;
-  const todayStart = Math.floor((options.nowMs + 8 * 60 * 60 * 1000) / 86_400_000) * 86_400 - 28_800;
+  const timeZone = options.timeZone ?? DEFAULT_TIME_ZONE;
+  const todayStart = zoneDayStart(Math.floor(options.nowMs / 1000), timeZone);
   const effectiveEnd = Math.min(options.endTime + 1, todayStart);
-  return Math.max(0, Math.floor((effectiveEnd - options.startTime) / 86_400));
+  // 按日历日计数：起点与终点都取零点，再按天数差计算，夏令时切换日不产生小数天
+  const startDay = zoneDayStart(options.startTime, timeZone);
+  return Math.max(0, Math.round((effectiveEnd - startDay) / 86_400));
 }
 
 function amount(value: number): number {

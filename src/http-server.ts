@@ -32,17 +32,18 @@ export interface AppConfig {
 }
 
 export interface HttpApplication {
-  /** 处理一个标准 Web Request。 */
+  /** 处理一个标准 Web Request */
   fetch(request: Request): Promise<Response>;
-  /** 关闭 MCP 处理器并释放其资源。 */
+  /** 关闭 MCP 处理器并释放其资源 */
   close(): Promise<void>;
 }
 
 const connectInput = z.strictObject({
   login: z.string().trim().min(1).max(320).optional(),
   password: z.string().regex(/^[a-f0-9]{32}$/),
+  timezone: z.string().trim().min(1).max(64).optional(),
 });
-/** 加载命名空间配置，并拒绝不安全的上游 TLS 设置。 */
+/** 加载命名空间配置，并拒绝不安全的上游 TLS 设置 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
     throw new Error("NODE_TLS_REJECT_UNAUTHORIZED=0 is forbidden");
@@ -82,14 +83,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   };
 }
 
-/** 围绕官方双版本 MCP 处理器组合 HTTP 路由。 */
+/** 围绕官方双版本 MCP 处理器组合 HTTP 路由 */
 export function createHttpApplication(
   config: AppConfig,
   store: DataStore,
   service: MoneyTrackService,
   bindingTickets = new BindingTicketManager(),
 ): HttpApplication {
-  // MCP 工厂在 fetch 期间执行，请求本地存储用于隔离并发请求的 PAT 身份。
+  // MCP 工厂在 fetch 期间执行，请求本地存储用于隔离并发请求的 PAT 身份
   const authentication = new AsyncLocalStorage<AuthenticatedPat>();
   const mcp = createMcpHandler(() => {
     const principal = authentication.getStore();
@@ -101,7 +102,7 @@ export function createHttpApplication(
   });
 
   return {
-    /** 处理绑定页面、账号绑定和 MCP 请求。 */
+    /** 处理绑定页面、账号绑定和 MCP 请求 */
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
       if (request.method === "GET" && url.pathname === "/connect") {
@@ -128,7 +129,7 @@ export function createHttpApplication(
   };
 }
 
-/** 启动远程 HTTP 服务，可选 TLS 终止由上游反向代理负责。 */
+/** 启动远程 HTTP 服务，可选 TLS 终止由上游反向代理负责 */
 export async function startServer(config = loadConfig()): Promise<{
   server: HttpServer;
   store: DataStore;
@@ -158,23 +159,29 @@ export async function startServer(config = loadConfig()): Promise<{
   }
 }
 
-/** 返回幂等关闭函数，先停止接收 HTTP 请求，再关闭 MCP 和存储。 */
+/** 返回幂等关闭函数，先停止接收 HTTP 请求，再关闭 MCP 和存储 */
 export function createShutdown(resources: Promise<{
-  server: { close(callback: (error?: Error) => void): unknown };
+  server: { close(callback: (error?: Error) => void): unknown; closeIdleConnections?(): void };
   store: Pick<DataStore, "close">;
   app: Pick<HttpApplication, "close">;
 }>): () => Promise<void> {
   let pending: Promise<void> | undefined;
   return () => pending ??= resources.then(async ({ server, app, store }) => {
     await new Promise<void>((resolve, reject) => {
-      server.close((error) => error ? reject(error) : resolve());
+      // Bun 1.4.3 起 close 回调要等全部连接断开，空闲 keep-alive 连接会拖到超时；
+      // 轮询掐断已空闲的连接，让停机在在途响应答完后立即完成
+      const sweeper = setInterval(() => server.closeIdleConnections?.(), 50);
+      server.close((error) => {
+        clearInterval(sweeper);
+        error ? reject(error) : resolve();
+      });
     });
     await app.close();
     await store.close();
   });
 }
 
-/** 校验同站来源和一次性凭证后执行钱迹账号绑定。 */
+/** 校验同站来源和一次性凭证后执行钱迹账号绑定 */
 async function handleConnect(
   request: Request,
   bindingTickets: BindingTicketManager,
@@ -184,14 +191,14 @@ async function handleConnect(
   if (!sameSiteRequest(request, publicOrigin)) return jsonResponse(403, { error: { code: "INVALID_ORIGIN", message: "拒绝跨站绑定请求" } });
   try {
     const input = connectInput.parse(await readJson(request));
-    await bindingTickets.redeem(request, (patId) => service.bindAccount(patId, input.login, input.password));
+    await bindingTickets.redeem(request, (patId) => service.bindAccount(patId, input.login, input.password, input.timezone));
     return jsonResponse(200, { bound: true });
   } catch (error) {
     return errorResponse(error);
   }
 }
 
-/** 构造带 Bearer 质询头的未认证响应。 */
+/** 构造带 Bearer 质询头的未认证响应 */
 function unauthorizedResponse(): Response {
   const response = jsonResponse(401, {
     error: { code: "MCP_UNAUTHENTICATED", message: "PAT 无效或已过期" },
@@ -200,7 +207,7 @@ function unauthorizedResponse(): Response {
   return response;
 }
 
-/** 在 32 KiB 上限内读取并解析 JSON 请求体。 */
+/** 在 32 KiB 上限内读取并解析 JSON 请求体 */
 async function readJson(request: Request): Promise<unknown> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     throw new AppError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
@@ -223,7 +230,7 @@ async function readJson(request: Request): Promise<unknown> {
   }
 }
 
-/** 由后端校验一次性票据，并构造带随机 CSP nonce 的连接页面。 */
+/** 由后端校验一次性票据，并构造带随机 CSP nonce 的连接页面 */
 async function connectPageResponse(
   ticket: string | null,
   bindingTickets: BindingTicketManager,
@@ -259,7 +266,7 @@ async function connectPageResponse(
   });
 }
 
-/** 只向连接页暴露足以识别账号的脱敏摘要。 */
+/** 只向连接页暴露足以识别账号的脱敏摘要 */
 function maskLoginIdentifier(login: string): string {
   const at = login.indexOf("@");
   if (at > 0) return `${login.slice(0, 1)}***${login.slice(at)}`;
@@ -268,7 +275,7 @@ function maskLoginIdentifier(login: string): string {
   return `${login.slice(0, 2)}***${login.slice(-2)}`;
 }
 
-/** 按公开地址校验浏览器来源，无来源头客户端仍须通过一次性票据认证。 */
+/** 按公开地址校验浏览器来源，无来源头客户端仍须通过一次性票据认证 */
 function sameSiteRequest(request: Request, publicOrigin: string): boolean {
   const site = request.headers.get("sec-fetch-site");
   if (site !== null && site !== "same-origin" && site !== "none") return false;
@@ -283,7 +290,7 @@ function sameSiteRequest(request: Request, publicOrigin: string): boolean {
   }
 }
 
-/** 将参数错误和应用错误转换为统一 JSON 响应。 */
+/** 将参数错误和应用错误转换为统一 JSON 响应 */
 function errorResponse(error: unknown): Response {
   if (error instanceof z.ZodError) {
     return jsonResponse(400, { error: { code: "INVALID_INPUT", message: "输入参数无效" } });
@@ -292,26 +299,26 @@ function errorResponse(error: unknown): Response {
   return jsonResponse(safe.httpStatus, { error: { code: safe.code, message: safe.message } });
 }
 
-/** 构造禁止缓存的 JSON 响应。 */
+/** 构造禁止缓存的 JSON 响应 */
 function jsonResponse(status: number, body: unknown): Response {
   return Response.json(body, { status, headers: { "cache-control": "no-store" } });
 }
 
-/** 读取必填环境变量。 */
+/** 读取必填环境变量 */
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name];
   if (!value) throw new Error(`${name} is required`);
   return value;
 }
 
-/** 将环境变量解析为有效 TCP 端口。 */
+/** 将环境变量解析为有效 TCP 端口 */
 function parseInteger(value: string, name: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) throw new Error(`${name} must be a valid port`);
   return parsed;
 }
 
-/** 解析可选的 PostgreSQL 或 MySQL 数据库地址。 */
+/** 解析可选的 PostgreSQL 或 MySQL 数据库地址 */
 function parseDatabaseUrl(value: string | undefined): URL | undefined {
   if (!value) return undefined;
   const url = new URL(value);
@@ -325,7 +332,7 @@ const entry = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
 if (import.meta.url === entry) {
   const running = startServer();
   const shutdown = createShutdown(running);
-  /** 收到终止信号后触发幂等关闭流程。 */
+  /** 收到终止信号后触发幂等关闭流程 */
   const handleSignal = (): void => {
     void shutdown().catch((error: unknown) => {
       console.error("Qianji MCP failed to stop:", error);

@@ -1,10 +1,10 @@
-/** 后端对当前一次性连接票据的页面裁决。 */
+/** 后端对当前一次性连接票据的页面裁决 */
 export type ConnectionPageState =
   | { status: "valid"; mode: "initial"; expiresAtMs: number; remainingMs: number }
   | { status: "valid"; mode: "relogin"; expiresAtMs: number; remainingMs: number; maskedLogin: string }
   | { status: "invalid" };
 
-/** 渲染自包含的钱迹账号连接页面。 */
+/** 渲染自包含的钱迹账号连接页面 */
 export function connectionPage(nonce: string, state: ConnectionPageState): string {
   const initialState = JSON.stringify(state).replaceAll("<", "\\u003c");
   return `<!doctype html>
@@ -82,6 +82,20 @@ export function connectionPage(nonce: string, state: ConnectionPageState): strin
         <label for="password">钱迹密码
           <input id="password" type="password" autocomplete="current-password" required maxlength="1024">
         </label>
+        <label for="timezone">记账时区
+          <input id="timezone" list="timezone-options" autocomplete="off" maxlength="64" spellcheck="false">
+          <datalist id="timezone-options">
+            <option value="Asia/Shanghai">北京时间</option>
+            <option value="Asia/Tokyo">东京</option>
+            <option value="Asia/Singapore">新加坡</option>
+            <option value="Asia/Dubai">迪拜</option>
+            <option value="Europe/London">伦敦</option>
+            <option value="Europe/Berlin">柏林</option>
+            <option value="America/New_York">纽约</option>
+            <option value="America/Los_Angeles">洛杉矶</option>
+            <option value="Australia/Sydney">悉尼</option>
+          </datalist>
+        </label>
         <button id="submit" type="submit"><span class="button-label">登录并连接</span></button>
         <output id="result" role="status" aria-live="polite"></output>
       </form>
@@ -99,7 +113,7 @@ export function connectionPage(nonce: string, state: ConnectionPageState): strin
   </dialog>
   <script nonce="${nonce}">
     const initialState=${initialState};
-    /** 在浏览器内计算密码的 MD5 摘要，避免提交明文密码。 */
+    /** 在浏览器内计算密码的 MD5 摘要，避免提交明文密码 */
     function md5(value){
       const input=new TextEncoder().encode(value);
       const size=Math.ceil((input.length+9)/64)*64;
@@ -143,6 +157,13 @@ export function connectionPage(nonce: string, state: ConnectionPageState): strin
     const accountSummary=document.querySelector('#account-summary');
     const maskedLogin=document.querySelector('#masked-login');
     const password=document.querySelector('#password');
+    const timezone=document.querySelector('#timezone');
+    // 浏览器知道用户实际所在时区，作为默认值，用户可手动修改
+    try{
+      const detected=new Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if(detected)timezone.value=detected;
+    }catch{timezone.value='Asia/Shanghai'}
+    if(!timezone.value)timezone.value='Asia/Shanghai';
     const submit=document.querySelector('#submit');
     const submitLabel=submit.querySelector('.button-label');
     const result=document.querySelector('#result');
@@ -163,7 +184,7 @@ export function connectionPage(nonce: string, state: ConnectionPageState): strin
       result.setAttribute('role',state==='error'?'alert':'status');
     }
     function disableForm(){
-      login.disabled=true;password.disabled=true;submit.disabled=true;
+      login.disabled=true;password.disabled=true;timezone.disabled=true;submit.disabled=true;
     }
     function showDialog(state){
       form.hidden=true;
@@ -214,7 +235,7 @@ export function connectionPage(nonce: string, state: ConnectionPageState): strin
         const response=await fetch('/connect',{
           method:'POST',
           headers:{'authorization':'Bearer '+ticket,'content-type':'application/json'},
-          body:JSON.stringify(initialState.mode==='relogin'?{password:md5(password.value)}:{login:login.value,password:md5(password.value)})
+          body:JSON.stringify({...(initialState.mode==='relogin'?{}:{login:login.value}),password:md5(password.value),timezone:timezone.value.trim()||'Asia/Shanghai'})
         });
         const body=await response.json();
         if(response.ok){

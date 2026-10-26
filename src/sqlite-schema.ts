@@ -1,4 +1,4 @@
-/** 单实例部署使用的权威 SQLite Schema。 */
+/** 单实例部署使用的权威 SQLite Schema */
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY,

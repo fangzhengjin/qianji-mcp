@@ -10,11 +10,11 @@ import {
   isPositiveLongId,
 } from "./ids.ts";
 import type { QianjiAccount } from "./data-store.ts";
+import { zoneOffsetSeconds } from "./time.ts";
 
 const CLIENT_PROFILE = {
   clang: "zh",
   cregion: "CN",
-  timezoneoffset: "28800",
   os: "1",
   osvs: "36",
   pkg: "com.mutangtech.qianji",
@@ -73,7 +73,7 @@ export interface QianjiClientOptions {
   baseUrl?: URL;
   fetch?: QianjiFetch;
   now?: () => number;
-  /** 可选的上游诊断 JSONL 文件，名称包含 token 的字段会被脱敏。 */
+  /** 可选的上游诊断 JSONL 文件，名称包含 token 的字段会被脱敏 */
   debugLogPath?: string;
 }
 
@@ -92,18 +92,18 @@ interface RawJsonNumber {
 }
 
 interface JsonWithRaw extends JSON {
-  /** 将已校验的数字文本作为原始 JSON token 输出。 */
+  /** 将已校验的数字文本作为原始 JSON token 输出 */
   rawJSON(text: string): RawJsonNumber;
-  /** 判断值是否为原始 JSON token。 */
+  /** 判断值是否为原始 JSON token */
   isRawJSON(value: unknown): value is RawJsonNumber;
 }
 
-/** 为钱迹旧协议计算小写 MD5。 */
+/** 为钱迹旧协议计算小写 MD5 */
 export function md5(value: string): string {
   return createHash("md5").update(value).digest("hex");
 }
 
-/** 从钱迹 API 路径提取两个签名组成部分。 */
+/** 从钱迹 API 路径提取两个签名组成部分 */
 export function extractCtrlAct(path: string): { ctrl: string; act: string } {
   const parts = path.split("/").filter(Boolean);
   if (parts.length !== 2) {
@@ -112,19 +112,19 @@ export function extractCtrlAct(path: string): { ctrl: string; act: string } {
   return { ctrl: parts[0]!, act: parts[1]! };
 }
 
-/** 按 Android 4.5.1b3 实际请求算法计算路径对应的 `tok`。 */
+/** 按 Android 4.5.1b3 实际请求算法计算路径对应的 `tok` */
 export function createTok(reqidv2: string, ctrl: string, act: string): string {
   const encReqid = md5(reqidv2 + TOK_SECRET);
   return md5(reqidv2 + "1172020" + ctrl + encReqid + act);
 }
 
-/** 按 Android 4.5.1b3 实际请求算法计算 `reqidv2`，时间可注入以支持确定性测试。 */
+/** 按 Android 4.5.1b3 实际请求算法计算 `reqidv2`，时间可注入以支持确定性测试 */
 export function createReqidv2(ctrl: string, act: string, epochMs = Date.now()): string {
   const shiftedMs = epochMs + Number(CLIENT_PROFILE.vs) + 9_081_127;
   return md5(CLIENT_PROFILE.pkg + String(shiftedMs) + ctrl + act + REQID_SECRET);
 }
 
-/** 解析 JSON，并将超出安全范围的整数字面量保留为原始 JSON 数字。 */
+/** 解析 JSON，并将超出安全范围的整数字面量保留为原始 JSON 数字 */
 export function parseQianjiJson(text: string): unknown {
   const json = JSON as JsonWithRaw;
   const parse = JSON.parse as unknown as (
@@ -145,12 +145,12 @@ export function parseQianjiJson(text: string): unknown {
   });
 }
 
-/** 判断值是否为保留下来的不安全原始 JSON 整数。 */
+/** 判断值是否为保留下来的不安全原始 JSON 整数 */
 export function isRawJsonNumber(value: unknown): boolean {
   return (JSON as JsonWithRaw).isRawJSON(value);
 }
 
-/** 将钱迹数字业务 ID 序列化为 JSON token，避免 JavaScript 数字精度丢失。 */
+/** 将钱迹数字业务 ID 序列化为 JSON token，避免 JavaScript 数字精度丢失 */
 export function stringifyQianjiPayload(payload: Record<string, unknown>): string {
   const json = JSON as JsonWithRaw;
   const bills = payload.bills && typeof payload.bills === "object" && !Array.isArray(payload.bills)
@@ -159,8 +159,8 @@ export function stringifyQianjiPayload(payload: Record<string, unknown>): string
   const changes = Array.isArray(bills.changelist) ? bills.changelist : [];
   const deletes = Array.isArray(bills.dellist) ? bills.dellist : [];
   return JSON.stringify(payload, function (this: unknown, key, value: unknown) {
-    // replacer 的 this 指向父容器，删除列表元素没有字段名，因此通过数组引用识别其 ID。
-    // 仅对已知协议位置转换原始数字，避免把备注等普通字符串误写为数字 token。
+    // replacer 的 this 指向父容器，删除列表元素没有字段名，因此通过数组引用识别其 ID
+    // 仅对已知协议位置转换原始数字，避免把备注等普通字符串误写为数字 token
     const accepts = changes.includes(this)
       ? key === "id"
         ? isPositiveLongId
@@ -185,7 +185,7 @@ export function stringifyQianjiPayload(payload: Record<string, unknown>): string
   });
 }
 
-/** 将账单 ID 列表序列化为保持精度的 JSON 数字数组。 */
+/** 将账单 ID 列表序列化为保持精度的 JSON 数字数组 */
 function stringifyQianjiIdList(ids: string[]): string {
   const json = JSON as JsonWithRaw;
   return JSON.stringify(ids.map((id) => {
@@ -194,7 +194,7 @@ function stringifyQianjiIdList(ids: string[]): string {
   }));
 }
 
-/** 钱迹私有 API 共用的表单编码 HTTP 客户端。 */
+/** 钱迹私有 API 共用的表单编码 HTTP 客户端 */
 export class QianjiClient {
   private readonly baseUrl: URL;
   private readonly fetchImpl: QianjiFetch;
@@ -202,7 +202,7 @@ export class QianjiClient {
   private readonly debugLogPath?: string;
   private readonly lastRequestMsByRoute = new Map<string, number>();
 
-  /** 创建钱迹客户端，并按需初始化权限受限的诊断日志文件。 */
+  /** 创建钱迹客户端，并按需初始化权限受限的诊断日志文件 */
   constructor(options: QianjiClientOptions = {}) {
     this.baseUrl = options.baseUrl ?? new URL("https://api.qianjiapp.com/");
     this.fetchImpl = options.fetch ?? fetch;
@@ -215,7 +215,7 @@ export class QianjiClient {
     }
   }
 
-  /** 使用浏览器计算的 MD5 摘要登录，且不在请求结束后保留摘要。 */
+  /** 使用浏览器计算的 MD5 摘要登录，且不在请求结束后保留摘要 */
   async login(account: string, passwordMd5: string, devid: string): Promise<LoginResult> {
     const data = await this.post("/account/login", { v: account, pwd: passwordMd5 }, { devid });
     const object = asObject(data);
@@ -238,7 +238,7 @@ export class QianjiClient {
     };
   }
 
-  /** 通过 APK 客户端初始化接口刷新用户和账本数据。 */
+  /** 通过 APK 客户端初始化接口刷新用户和账本数据 */
   async initialize(account: QianjiAccount, currentIsVip: boolean): Promise<ClientInitResult> {
     const data = asObject(await this.authPost(account, "/client/init", {
       v: 0,
@@ -265,13 +265,13 @@ export class QianjiClient {
     };
   }
 
-  /** 通过统一认证传输读取可见或全部账本。 */
+  /** 通过统一认证传输读取可见或全部账本 */
   async listBooks(account: QianjiAccount, includeHidden: boolean): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/book/list", { t: includeHidden ? -1 : 1 }));
     return asObjectArray(data.list).map(normalizeBook);
   }
 
-  /** 读取指定账本的成员候选。 */
+  /** 读取指定账本的成员候选 */
   async listBookMembers(account: QianjiAccount, bookId: string): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/book/members", { bookid: bookId }));
     return asObjectArray(data.list).map((member) => ({
@@ -280,7 +280,7 @@ export class QianjiClient {
     }));
   }
 
-  /** 通过统一认证传输读取正常或全部资产。 */
+  /** 通过统一认证传输读取正常或全部资产 */
   async listAssets(account: QianjiAccount, includeHidden: boolean): Promise<Record<string, unknown>[]> {
     const statuses = includeHidden ? [0, 2] : [0];
     const responses = await Promise.all(
@@ -305,7 +305,7 @@ export class QianjiClient {
     return [...new Map(assets.map((asset) => [asset.id, asset])).values()];
   }
 
-  /** 按借入/借出方向和状态读取独立详情列表。 */
+  /** 按借入/借出方向和状态读取独立详情列表 */
   async listDebtAccounts(
     account: QianjiAccount,
     direction: 51 | 52,
@@ -315,7 +315,7 @@ export class QianjiClient {
     return asObjectArray(data.list).map((asset) => ({ ...asset, id: positiveIdText(asset.id, "借入或借出记录") }));
   }
 
-  /** 读取跨币种写入所需的币种标识、价格和价格时间。 */
+  /** 读取跨币种写入所需的币种标识、价格和价格时间 */
   async listCurrencies(account: QianjiAccount): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/currency/listv2", {}));
     return asObjectArray(data.list).map((currency) => ({
@@ -325,13 +325,13 @@ export class QianjiClient {
     }));
   }
 
-  /** 读取指定账本和账单类型的分类。 */
+  /** 读取指定账本和账单类型的分类 */
   async listCategories(account: QianjiAccount, bookId: string, type: -1 | 0 | 1): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/category/listv2", { bookid: bookId, t: type }));
     return asObjectArray(data.list).map(normalizeCategory);
   }
 
-  /** 读取指定账本和月份或年份的预算定义。 */
+  /** 读取指定账本和月份或年份的预算定义 */
   async listBudgets(
     account: QianjiAccount,
     bookId: string,
@@ -359,7 +359,7 @@ export class QianjiClient {
     });
   }
 
-  /** 读取正常及归档标签组，并展开其中的嵌套标签。 */
+  /** 读取正常及归档标签组，并展开其中的嵌套标签 */
   async listTags(account: QianjiAccount, status: -1 | 1 | 2, lastTime = 0): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/tag/list", { status, lasttime: lastTime }, true));
     return asObjectArray(data.list).flatMap((group) => {
@@ -374,7 +374,7 @@ export class QianjiClient {
     });
   }
 
-  /** 从钱迹增量同步协议读取一页数据。 */
+  /** 从钱迹增量同步协议读取一页数据 */
   async pullBills(
     account: QianjiAccount,
     request: {
@@ -414,7 +414,7 @@ export class QianjiClient {
     };
   }
 
-  /** 发送兼容钱迹账单创建、更新和删除结构的同步载荷。 */
+  /** 发送兼容钱迹账单创建、更新和删除结构的同步载荷 */
   async syncBills(account: QianjiAccount, payload: Record<string, unknown>): Promise<SyncBillResult> {
     const data = asObject(
       await this.authPost(account, "/bill/syncall", { v: stringifyQianjiPayload(payload) }, true),
@@ -429,7 +429,7 @@ export class QianjiClient {
     };
   }
 
-  /** 创建或更新退款，并返回钱迹解析 `data.list` 得到的完整账单组。 */
+  /** 创建或更新退款，并返回钱迹解析 `data.list` 得到的完整账单组 */
   async refundBill(
     account: QianjiAccount,
     sourceBillId: string,
@@ -442,7 +442,7 @@ export class QianjiClient {
     return asObjectArray(data.list).map(normalizeBillIds);
   }
 
-  /** 通过 APK 接口报销源账单，并返回全部变更账单及相关资产。 */
+  /** 通过 APK 接口报销源账单，并返回全部变更账单及相关资产 */
   async reimburseBills(
     account: QianjiAccount,
     input: {
@@ -468,7 +468,7 @@ export class QianjiClient {
     };
   }
 
-  /** 按 APK 的一次性账号迁移接口启用新版报销，且只接受明确的成功值 1。 */
+  /** 按 APK 的一次性账号迁移接口启用新版报销，且只接受明确的成功值 1 */
   async upgradeReimbursement(account: QianjiAccount): Promise<void> {
     const data = await this.authPost(account, "/baoxiao/upgradev2", {});
     const value = data && typeof data === "object" && !Array.isArray(data) &&
@@ -480,14 +480,14 @@ export class QianjiClient {
     }
   }
 
-  /** 按 APK 契约使用源账单 ID 取消报销关系。 */
+  /** 按 APK 契约使用源账单 ID 取消报销关系 */
   async cancelReimbursement(account: QianjiAccount, sourceBillIds: string[]): Promise<void> {
     await this.authPost(account, "/baoxiao/cancelbaoxiao", {
       v: stringifyQianjiIdList(sourceBillIds),
     });
   }
 
-  /** 为已绑定账号补充认证字段后发送 POST 请求。 */
+  /** 为已绑定账号补充认证字段后发送 POST 请求 */
   private async authPost(
     account: QianjiAccount,
     path: string,
@@ -497,23 +497,27 @@ export class QianjiClient {
     return this.post(
       path,
       { uid: account.uid, ...body, fr: account.uid },
-      { devid: account.devid, utoken: account.utoken, htoken },
+      { devid: account.devid, utoken: account.utoken, htoken, timeZone: account.timeZone },
     );
   }
 
-  /** 构造签名、执行表单请求并将钱迹响应转换为稳定错误或业务数据。 */
+  /** 构造签名、执行表单请求并将钱迹响应转换为稳定错误或业务数据 */
   private async post(
     path: string,
     body: Record<string, string | number>,
-    auth: { devid: string; utoken?: string; htoken?: boolean },
+    auth: { devid: string; utoken?: string; htoken?: boolean; timeZone?: string },
   ): Promise<unknown> {
     const { ctrl, act } = extractCtrlAct(path);
     const route = `${ctrl}/${act}`;
     const now = this.now();
-    // 钱迹会拒绝同一路径同一毫秒产生的重复 reqidv2。
+    // 钱迹会拒绝同一路径同一毫秒产生的重复 reqidv2
     const requestMs = Math.max(now, (this.lastRequestMsByRoute.get(route) ?? now - 1) + 1);
     this.lastRequestMsByRoute.set(route, requestMs);
     const reqidv2 = createReqidv2(ctrl, act, requestMs);
+    // 官方客户端按设备时区实时上报偏移，此处按账号记账时区在请求时刻计算，含夏令时修正
+    const timezoneoffset = auth.timeZone
+      ? String(zoneOffsetSeconds(auth.timeZone, Math.floor(requestMs / 1000)))
+      : "28800";
     const headers = new Headers({
       ...CLIENT_PROFILE,
       ctrl,
@@ -521,6 +525,7 @@ export class QianjiClient {
       reqidv2,
       tok: createTok(reqidv2, ctrl, act),
       devid: auth.devid,
+      timezoneoffset,
       "content-type": "application/x-www-form-urlencoded",
     });
     if (auth.utoken) headers.set("utoken", auth.utoken);
@@ -594,11 +599,11 @@ export class QianjiClient {
     return envelope.data;
   }
 
-  /** 以脱敏 JSONL 追加可选诊断记录，日志失败不影响业务请求。 */
+  /** 以脱敏 JSONL 追加可选诊断记录，日志失败不影响业务请求 */
   private writeDebugLog(url: URL, requestBody: string, status: number | null, responseBody: string | null): void {
     if (!this.debugLogPath) return;
     try {
-      // ponytail: 可选诊断采用同步追加已足够，吞吐成为实际问题时再接入部署日志管道。
+      // ponytail: 可选诊断采用同步追加已足够，吞吐成为实际问题时再接入部署日志管道
       appendFileSync(this.debugLogPath, `${JSON.stringify({
         timestamp: new Date().toISOString(),
         method: "POST",
@@ -615,7 +620,7 @@ export class QianjiClient {
   }
 }
 
-/** 脱敏表单中名称包含 token 的字段及嵌套 JSON。 */
+/** 脱敏表单中名称包含 token 的字段及嵌套 JSON */
 function redactFormBody(body: string): string {
   const form = new URLSearchParams(body);
   for (const [key, value] of form) {
@@ -624,7 +629,7 @@ function redactFormBody(body: string): string {
   return form.toString();
 }
 
-/** 尝试脱敏 JSON 文本，非 JSON 内容保持原文。 */
+/** 尝试脱敏 JSON 文本，非 JSON 内容保持原文 */
 function redactJsonText(text: string): string {
   try {
     const value = parseQianjiJson(text);
@@ -635,7 +640,7 @@ function redactJsonText(text: string): string {
   }
 }
 
-/** 递归脱敏对象中名称包含 token 的字段。 */
+/** 递归脱敏对象中名称包含 token 的字段 */
 function redactTokenFields(value: unknown): unknown {
   if (isRawJsonNumber(value)) return value;
   if (Array.isArray(value)) return value.map(redactTokenFields);
@@ -645,7 +650,7 @@ function redactTokenFields(value: unknown): unknown {
   );
 }
 
-/** 从钱迹 JSON 或纯文本错误中提取可用于分类的消息。 */
+/** 从钱迹 JSON 或纯文本错误中提取可用于分类的消息 */
 function qianjiErrorMessage(value: unknown): string {
   if (typeof value !== "string") return "";
   try {
@@ -654,12 +659,12 @@ function qianjiErrorMessage(value: unknown): string {
       return (parsed as Record<string, unknown>).msg as string;
     }
   } catch {
-    // 钱迹也可能直接返回纯文本错误消息。
+    // 钱迹也可能直接返回纯文本错误消息
   }
   return value;
 }
 
-/** 要求上游值为非数组对象。 */
+/** 要求上游值为非数组对象 */
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹服务返回了无效数据", 502);
@@ -667,7 +672,7 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-/** 要求上游值为数组。 */
+/** 要求上游值为数组 */
 function asArray(value: unknown): unknown[] {
   if (!Array.isArray(value)) {
     throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹服务返回了无效列表", 502);
@@ -675,14 +680,14 @@ function asArray(value: unknown): unknown[] {
   return value;
 }
 
-/** 将普通数字或原始 JSON 数字转换为精确文本。 */
+/** 将普通数字或原始 JSON 数字转换为精确文本 */
 function numericText(value: unknown): string {
   const json = JSON as JsonWithRaw;
   if (json.isRawJSON(value)) return value.rawJSON;
   return typeof value === "string" || typeof value === "number" ? String(value) : "";
 }
 
-/** 校验并转换正整数资源 ID。 */
+/** 校验并转换正整数资源 ID */
 function positiveIdText(value: unknown, resource: string): string {
   const text = numericText(value);
   if (!isPositiveLongId(text)) {
@@ -691,7 +696,7 @@ function positiveIdText(value: unknown, resource: string): string {
   return text;
 }
 
-/** 校验并转换允许父分类哨兵值的引用 ID。 */
+/** 校验并转换允许父分类哨兵值的引用 ID */
 function referenceIdText(value: unknown, resource: string): string {
   const text = numericText(value);
   if (!isParentLongId(text)) {
@@ -700,7 +705,7 @@ function referenceIdText(value: unknown, resource: string): string {
   return text;
 }
 
-/** 校验并转换允许 `-1` 的资源 ID。 */
+/** 校验并转换允许 `-1` 的资源 ID */
 function optionalPositiveIdText(value: unknown, resource: string): string {
   const text = numericText(value);
   if (!isOptionalPositiveLongId(text)) {
@@ -709,25 +714,25 @@ function optionalPositiveIdText(value: unknown, resource: string): string {
   return text;
 }
 
-/** 将不透明资源 ID 转换为非空文本。 */
+/** 将不透明资源 ID 转换为非空文本 */
 function opaqueIdText(value: unknown, resource: string): string {
   const text = numericText(value);
   if (!text) throw new AppError("QIANJI_RESPONSE_INVALID", `钱迹返回了无效${resource} ID`, 502);
   return text;
 }
 
-/** 转换标签组 ID，并保留空字符串表示默认组。 */
+/** 转换标签组 ID，并保留空字符串表示默认组 */
 function tagGroupIdText(value: unknown): string {
   if (value === undefined || value === null || value === "") return "";
   return opaqueIdText(value, "标签组");
 }
 
-/** 规范化钱迹账本对象中的账本 ID。 */
+/** 规范化钱迹账本对象中的账本 ID */
 function normalizeBook(book: Record<string, unknown>): Record<string, unknown> {
   return { ...book, bookid: optionalPositiveIdText(book.bookid, "账本") };
 }
 
-/** 规范化完整钱迹账单中的全部业务 ID。 */
+/** 规范化完整钱迹账单中的全部业务 ID */
 function normalizeBillIds(bill: Record<string, unknown>): Record<string, unknown> {
   const normalized: Record<string, unknown> = {
     ...bill,
@@ -754,7 +759,7 @@ function normalizeBillIds(bill: Record<string, unknown>): Record<string, unknown
   return normalized;
 }
 
-/** 规范化同步分页中携带的分类 ID 和账本 ID。 */
+/** 规范化同步分页中携带的分类 ID 和账本 ID */
 function normalizePullCategory(category: Record<string, unknown>): Record<string, unknown> {
   const normalized: Record<string, unknown> = {
     ...category,
@@ -766,7 +771,7 @@ function normalizePullCategory(category: Record<string, unknown>): Record<string
   return normalized;
 }
 
-/** 规范化分类及其直属子分类中的 ID。 */
+/** 规范化分类及其直属子分类中的 ID */
 function normalizeCategory(category: Record<string, unknown>): Record<string, unknown> {
   const normalized: Record<string, unknown> = {
     ...category,
@@ -783,7 +788,7 @@ function normalizeCategory(category: Record<string, unknown>): Record<string, un
   return normalized;
 }
 
-/** 要求上游值为对象数组。 */
+/** 要求上游值为对象数组 */
 function asObjectArray(value: unknown): Record<string, unknown>[] {
   return asArray(value).map(asObject);
 }
