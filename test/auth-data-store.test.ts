@@ -249,6 +249,7 @@ test("旧同步游标迁移为账号唯一游标并删除退休目录缓存表",
       PRIMARY KEY (account_id, bookid)
     );
     INSERT INTO sync_state VALUES (${account.id}, -1, '{"cursor":7}', 1770000000);
+    INSERT INTO sync_state VALUES (${account.id}, 1, '{"cursor":99}', 1770000001);
     CREATE TABLE books (id INTEGER);
     CREATE TABLE assets (id INTEGER);
     CREATE TABLE categories (id INTEGER);
@@ -260,6 +261,7 @@ test("旧同步游标迁移为账号唯一游标并删除退休目录缓存表",
   t.after(() => migrated.close());
   assert.equal(migrated.verifyPat(pat.token)?.accountId, account.id);
   assert.deepEqual(migrated.getSyncState(account.id), { cursor: 7 });
+  assert.equal(Number((migrated.db.prepare("SELECT COUNT(*) AS count FROM sync_state").get() as { count: number | bigint }).count), 1);
   const columns = migrated.db.prepare("PRAGMA table_info(sync_state)").all() as Array<{ name: string }>;
   assert.deepEqual(columns.map(({ name }) => name), ["account_id", "lasttimes_json"]);
   const tables = migrated.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;

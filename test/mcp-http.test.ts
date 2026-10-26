@@ -1791,7 +1791,7 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
   };
   const script = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(pageHtml)?.[1];
   assert.ok(script);
-  runInNewContext(script, {
+  const pageContext: Record<string, unknown> = {
     TextEncoder,
     URLSearchParams,
     location: { pathname: "/connect", search: `?ticket=${ticket}` },
@@ -1814,7 +1814,12 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
         json: async () => responseOk ? { bound: true } : { error: { code: "TEST_ERROR", message: "测试失败" } },
       };
     },
-  });
+  };
+  runInNewContext(script, pageContext);
+  // 页面内联 MD5 与服务端实现必须逐比特一致，样本覆盖空串、多字节与块填充边界
+  for (const sample of ["", "a", "中文密码", "😀", "x".repeat(55), "y".repeat(56), "w".repeat(1000)]) {
+    assert.equal((pageContext.md5 as (input: string) => string)(sample), md5(sample));
+  }
   assert.equal(replacedUrl, "/connect");
   assert.match(linkNote.textContent, /^链接有效至 .+/);
   assert.equal(linkNote.hidden, false);
