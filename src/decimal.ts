@@ -3,25 +3,25 @@ interface DecimalParts {
   scale: number;
 }
 
-/** 按 `BigDecimal.valueOf(double)` 的十进制文本语义相加。 */
+/** 按 `BigDecimal.valueOf(double)` 的十进制文本语义相加 */
 export function decimalAdd(left: number, right: number): number {
   const [a, b] = align(decimalParts(left), decimalParts(right));
   return decimalNumber({ coefficient: a.coefficient + b.coefficient, scale: a.scale });
 }
 
-/** 按 `BigDecimal.valueOf(double)` 的十进制文本语义相减。 */
+/** 按 `BigDecimal.valueOf(double)` 的十进制文本语义相减 */
 export function decimalSubtract(left: number, right: number): number {
   return decimalAdd(left, -right);
 }
 
-/** 按 `BigDecimal.valueOf(double)` 的十进制文本语义相乘。 */
+/** 按 `BigDecimal.valueOf(double)` 的十进制文本语义相乘 */
 export function decimalMultiply(left: number, right: number): number {
   const a = decimalParts(left);
   const b = decimalParts(right);
   return decimalNumber({ coefficient: a.coefficient * b.coefficient, scale: a.scale + b.scale });
 }
 
-/** 按指定小数位和舍入模式执行十进制除法。 */
+/** 按指定小数位和舍入模式执行十进制除法 */
 export function decimalDivide(
   left: number,
   right: number,
@@ -44,12 +44,12 @@ export function decimalDivide(
   return decimalNumber({ coefficient: negative ? -quotient : quotient, scale });
 }
 
-/** 按指定小数位和舍入模式执行十进制舍入。 */
+/** 按指定小数位和舍入模式执行十进制舍入 */
 export function decimalRound(value: number, scale: number): number {
   return decimalDivide(value, 1, scale);
 }
 
-/** 按 Java `NumberFormat` 对 IEEE-754 double 的实际值执行舍入。 */
+/** 按 Java `NumberFormat` 对 IEEE-754 double 的实际值执行舍入 */
 export function binaryRound(value: number, scale: number): number {
   if (!Number.isFinite(value)) throw new RangeError("二进制舍入只接受有限数字");
   if (!Number.isInteger(scale) || scale < 0) throw new RangeError("二进制舍入的小数位必须是非负整数");

@@ -35,7 +35,6 @@ import {
   type CreateBillInput,
   type CreateRefundInput,
   type CreateTransferInput,
-  type DeleteBillInput,
   type BillStatisticsInput,
   type CurrencyConversionInput,
   type ListBillsInput,
@@ -47,6 +46,7 @@ import {
   type UpdateTransferPatch,
   MAX_BILL_CURSOR_LENGTH,
   MAX_MONEY,
+  MAX_OPAQUE_ID_LENGTH,
   MAX_SEARCH_KEYWORD_LENGTH,
 } from "./bill-rules.ts";
 
@@ -80,6 +80,7 @@ import {
 } from "./qianji-mappers.ts";
 import { QianjiClient, type BudgetPeriod, type PullPage, type SyncBillResult } from "./qianji-client.ts";
 import { calculateBillStatistics, calculateBudgetBillAmounts, type StatisticsUnit } from "./bill-statistics.ts";
+import { DEFAULT_TIME_ZONE, isValidTimeZone, zoneCalendarParts, zoneDateKey, zoneDayEpoch, zoneDayStart, zoneOffsetSeconds } from "./time.ts";
 
 interface CursorPayload {
   v: 2;
@@ -139,7 +140,7 @@ export interface GetBudgetInput {
   includeDailyStatistics?: boolean;
 }
 
-// 这些展示字段由钱迹服务端派生，更新完整对象前必须删除，随后按业务场景重新构造。
+// 这些展示字段由钱迹服务端派生，更新完整对象前必须删除，随后按业务场景重新构造
 const DISPLAY_FIELDS = ["category", "fromact", "targetact", "paytype", "bookname"];
 const GLOBAL_SYNC_BOOK_ID = "-1";
 const USER_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
@@ -155,7 +156,7 @@ const CATALOG_TTL_MS = {
   currencies: 4 * 60 * 60 * 1000,
 } as const;
 
-/** 统一编排账号绑定、缓存读取、事务同步及受配额约束的账单写入。 */
+/** 统一编排账号绑定、缓存读取、事务同步及受配额约束的账单写入 */
 export class MoneyTrackService {
   private readonly store: DataStore;
   private readonly client: QianjiClient;
@@ -165,20 +166,23 @@ export class MoneyTrackService {
   private readonly initialSyncs = new Map<number, Promise<void>>();
   private readonly initialSyncFailures = new Map<number, AppError>();
 
-  /** 创建业务服务，时间函数可注入，以便确定性验证缓存和配额边界。 */
+  /** 创建业务服务，时间函数可注入，以便确定性验证缓存和配额边界 */
   constructor(store: DataStore, client: QianjiClient, now: () => number = Date.now) {
     this.store = store;
     this.client = client;
     this.now = now;
   }
 
-  /** 等待登录后仍在进行的账单同步结束，供服务关闭前安全释放存储。 */
+  /** 等待登录后仍在进行的账单同步结束，供服务关闭前安全释放存储 */
   async close(): Promise<void> {
     await Promise.all(this.initialSyncs.values());
   }
 
-  /** 使用浏览器计算的密码摘要绑定钱迹账号，且不持久化密码摘要。 */
-  async bindAccount(patId: number, login: string | undefined, passwordMd5: string): Promise<void> {
+  /** 使用浏览器计算的密码摘要绑定钱迹账号，且不持久化密码摘要 */
+  async bindAccount(patId: number, login: string | undefined, passwordMd5: string, timeZone?: string): Promise<void> {
+    if (timeZone !== undefined && !isValidTimeZone(timeZone)) {
+      throw new AppError("INVALID_TIME_ZONE", "timezone 必须是有效的 IANA 时区名称，例如 Asia/Shanghai 或 America/New_York");
+    }
     await this.withLock(`pat:${patId}`, async () => {
       const connection = await this.store.getPatConnection(patId);
       if (!connection) throw new AppError("PAT_NOT_FOUND", "PAT 不存在或已过期", 404);
@@ -204,11 +208,13 @@ export class MoneyTrackService {
           uid: result.uid,
           utoken: result.utoken,
           devid,
+          // 绑定前的临时账号对象按默认时区上报，与登录阶段 28800 偏移的既有行为一致
+          timeZone: DEFAULT_TIME_ZONE,
         }, isVip(result.user, this.now()));
         if (String(initialized.user.id) !== result.uid) {
           throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹登录初始化返回了不一致的用户 ID", 502);
         }
-        const account = await this.store.bindPat(patId, result.uid, result.utoken, devid, effectiveLogin);
+        const account = await this.store.bindPat(patId, result.uid, result.utoken, devid, effectiveLogin, timeZone);
         const refreshedAtMs = this.now();
         await this.store.setUserCache(account.id, userWithConfig(initialized.user, initialized.userConfig), refreshedAtMs);
         await this.store.setCatalogCache(account.id, "books", "", initialized.books, refreshedAtMs);
@@ -220,7 +226,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 解绑当前 PAT，只有账号不再被其他 PAT 使用时才删除其全部本地数据。 */
+  /** 解绑当前 PAT，只有账号不再被其他 PAT 使用时才删除其全部本地数据 */
   async unbindAccount(patId: number, accountId: number) {
     return this.withLock(`pat:${patId}`, async () => {
       this.requireDataSyncNotRunning(accountId);
@@ -230,14 +236,14 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回最小用户资料、缓存期内的 VIP 状态和当天共享写入配额。 */
+  /** 返回最小用户资料、缓存期内的 VIP 状态和当天共享写入配额 */
   async getUserInfo(accountId: number): Promise<Record<string, unknown>> {
     return this.withAccount(accountId, async (account) =>
-      publicUser(await this.loadUserWithCurrencyConfig(account), this.store, account.id, this.now()),
+      publicUser(await this.loadUserWithCurrencyConfig(account), this.store, account.id, this.now(), account.timeZone),
     );
   }
 
-  /** 返回当前账号可访问的账本，并按需刷新 12 小时持久化快照。 */
+  /** 返回当前账号可访问的账本，并按需刷新 12 小时持久化快照 */
   async listBooks(accountId: number, includeHidden: boolean, nameKeyword?: string): Promise<Record<string, unknown>[]> {
     return this.withAccount(accountId, async (account) => {
       const books = await this.loadBooks(account);
@@ -249,7 +255,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回指定账本的成员 ID 和名称，用于账单及统计成员筛选。 */
+  /** 返回指定账本的成员 ID 和名称，用于账单及统计成员筛选 */
   async listBookMembers(accountId: number, bookIdInput: BookIdInput = GLOBAL_SYNC_BOOK_ID): Promise<Record<string, unknown>[]> {
     const bookId = normalizeBookId(bookIdInput);
     return this.withAccount(accountId, async (account) => {
@@ -258,7 +264,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回按自定义分组或资产类型组织的资产，分组标题本身不可选择。 */
+  /** 返回按自定义分组或资产类型组织的资产，分组标题本身不可选择 */
   async listAssets(
     accountId: number,
     includeHidden: boolean,
@@ -275,11 +281,11 @@ export class MoneyTrackService {
       const baseCurrency = filtered.some((asset) => String(asset.currency ?? "").trim() === "")
         ? requireBaseCurrency(await this.loadUserWithCurrencyConfig(account))
         : "";
-      return publicAssetGroups(filtered, includeBalances, baseCurrency, this.now());
+      return publicAssetGroups(filtered, includeBalances, baseCurrency, this.now(), account.timeZone);
     });
   }
 
-  /** 独立查询借入或借出详情，不与普通资产快照聚合。 */
+  /** 独立查询借入或借出详情，不与普通资产快照聚合 */
   async listDebtAccounts(
     accountId: number,
     direction: "borrowed" | "lent",
@@ -295,7 +301,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回指定账本的分类，并按需刷新 30 分钟持久化快照。 */
+  /** 返回指定账本的分类，并按需刷新 30 分钟持久化快照 */
   async listCategories(
     accountId: number,
     bookIdInput: BookIdInput = GLOBAL_SYNC_BOOK_ID,
@@ -311,7 +317,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回按钱迹分组组织的标签，分组标题本身不可选择。 */
+  /** 返回按钱迹分组组织的标签，分组标题本身不可选择 */
   async listTags(accountId: number, status: -1 | 1 | 2): Promise<Record<string, unknown>[]> {
     return this.withAccount(accountId, async (account) => {
       const tags = await this.loadTags(account);
@@ -319,7 +325,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 强制刷新当前账号的用户、账单及全部目录快照。 */
+  /** 强制刷新当前账号的用户、账单及全部目录快照 */
   async refreshCache(accountId: number): Promise<{
     userRefreshed: true;
     bookCount: number;
@@ -369,7 +375,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 增量同步账单后执行筛选，并使用键集游标返回账单摘要。 */
+  /** 增量同步账单后执行筛选，并使用键集游标返回账单摘要 */
   async listBills(accountId: number, input: ListBillsInput): Promise<ListBillsResult> {
     return this.withBillAccount(accountId, async (account) => {
       if (input.cursor && hasExplicitBillFilters(input)) {
@@ -460,7 +466,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 对 APK 完整本地搜索条件执行一次统一筛选，默认简单查询仍走存储层键集分页。 */
+  /** 对 APK 完整本地搜索条件执行一次统一筛选，默认简单查询仍走存储层键集分页 */
   private async listBillsAdvanced(
     account: QianjiAccount,
     input: Omit<ListBillsInput, "cursor" | "limit">,
@@ -523,18 +529,21 @@ export class MoneyTrackService {
     };
   }
 
-  /** 在账号完成首次同步后返回一条完整的本地账单。 */
-  async getBill(accountId: number, billId: BillIdInput): Promise<Record<string, unknown>> {
+  /** 在账号完成首次同步后按 ID 集合返回本地账单，只包含存在的账单，顺序与输入去重后的顺序一致 */
+  async getBills(accountId: number, billIds: BillIdInput[]): Promise<Record<string, unknown>[]> {
     return this.withBillAccount(accountId, async (account) => {
-      const id = normalizeBillId(billId);
+      const uniqueIds = [...new Set(billIds.map(normalizeBillId))];
       if (await this.store.getSyncState(account.id) === undefined) await this.syncUnlocked(account);
-      const bill = await this.store.getBill(account.id, id);
-      if (!bill) throw new AppError("BILL_NOT_FOUND", "账单不存在", 404);
-      return publicBill(cachedBillObject(bill));
+      const rows = await this.store.getBills(account.id, uniqueIds);
+      const rowById = new Map(rows.map((row) => [row.id, row]));
+      return uniqueIds.flatMap((id) => {
+        const row = rowById.get(id);
+        return row ? [publicBill(cachedBillObject(row))] : [];
+      });
     });
   }
 
-  /** 按 APK 主报表固定结构聚合本地账单，不提供任意分组。 */
+  /** 按 APK 主报表固定结构聚合本地账单，不提供任意分组 */
   async getBillStatistics(accountId: number, input: BillStatisticsInput): Promise<Record<string, unknown>> {
     return this.withBillAccount(accountId, async (account) => {
       if (await this.store.getSyncState(account.id) === undefined) await this.syncUnlocked(account);
@@ -542,7 +551,8 @@ export class MoneyTrackService {
       const selectedBook = bookId === undefined ? undefined : await this.requireBook(account, bookId);
       const books = bookId === undefined ? await this.loadBooks(account) : [selectedBook ?? { bookid: bookId }];
       const allRows = await this.store.listBills(account.id, { limit: BILL_SCAN_LIMIT });
-      const range = statisticsRange(input, books, allRows, this.now());
+      const timeZone = account.timeZone;
+      const range = statisticsRange(input, books, allRows, this.now(), timeZone);
       const rows = allRows.filter((row) =>
         (bookId === undefined || row.bookid === bookId) && row.time >= range.startTime && row.time <= range.endTime
       );
@@ -572,11 +582,12 @@ export class MoneyTrackService {
         tagMatch: input.tagMatch,
         categoryIds,
         nowMs: this.now(),
+        timeZone,
       });
     });
   }
 
-  /** 按 APK 预算页口径聚合官方预算定义和本地账单。 */
+  /** 按 APK 预算页口径聚合官方预算定义和本地账单 */
   async getBudget(accountId: number, input: GetBudgetInput): Promise<Record<string, unknown>> {
     return this.withBillAccount(accountId, async (account) => {
       const bookId = normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID);
@@ -585,7 +596,8 @@ export class MoneyTrackService {
         : await this.requireBook(account, bookId);
       const range = budgetBookRange(book);
       const nowMs = this.now();
-      const period = resolveBudgetPeriod(input.period, range, nowMs);
+      const timeZone = account.timeZone;
+      const period = resolveBudgetPeriod(input.period, range, nowMs, timeZone);
       const budgets = await this.client.listBudgets(account, bookId, period.filter, range);
       if (await this.store.getSyncState(account.id) === undefined) await this.syncUnlocked(account);
       const allRows = await this.store.listBills(account.id, { limit: BILL_SCAN_LIMIT });
@@ -601,11 +613,12 @@ export class MoneyTrackService {
         currency: requireBaseCurrency(await this.loadUserWithCurrencyConfig(account)),
         includeDailyStatistics: input.includeDailyStatistics === true,
         nowMs,
+        timeZone,
       });
     });
   }
 
-  /** 一次提交创建一笔或多笔普通收入、支出或待报销支出。 */
+  /** 一次提交创建一笔或多笔普通收入、支出或待报销支出 */
   async createBills(accountId: number, inputs: CreateBillInput[]): Promise<{ bills: Record<string, unknown>[] }> {
     if (inputs.length === 0) throw new AppError("INVALID_BILLS", "bills 不能为空");
     return this.withBillAccount(accountId, async (account) => {
@@ -686,7 +699,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 一次提交一项或多项普通账单补丁，并逐项确认最终状态。 */
+  /** 一次提交一项或多项普通账单补丁，并逐项确认最终状态 */
   async updateBills(
     accountId: number,
     updates: Array<{ billId: BillIdInput; patch: UpdateBillPatch }>,
@@ -830,18 +843,14 @@ export class MoneyTrackService {
     });
   }
 
-  /** 一次删除一笔或多笔账单，关联范围必须逐项显式确认。 */
-  async deleteBills(
-    accountId: number,
-    deletions: DeleteBillInput[],
-  ): Promise<{ deleted: Array<{ billId: string; relatedBillIds: string[] }> }> {
-    if (deletions.length === 0) throw new AppError("INVALID_DELETIONS", "deletions 不能为空");
-    const ids = deletions.map(({ billId }) => normalizeBillId(billId));
-    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_DELETIONS", "deletions 不能包含重复 billId");
+  /** 一次删除一笔或多笔账单，与钱迹 APP 一致，自动连带删除退款和报销关联子账单 */
+  async deleteBills(accountId: number, billIds: BillIdInput[]): Promise<{ deleted: true }> {
+    if (billIds.length === 0) throw new AppError("INVALID_BILL_IDS", "billIds 不能为空");
+    const ids = billIds.map(normalizeBillId);
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_BILL_IDS", "billIds 不能包含重复 billId");
     return this.withBillAccount(accountId, async (account) => {
       await this.syncUnlocked(account);
       const expanded = new Set<string>();
-      const deleted: Array<{ billId: string; relatedBillIds: string[] }> = [];
       for (const [index, id] of ids.entries()) {
         const row = await this.store.getBill(account.id, id);
         if (!row) throw new AppError("BILL_NOT_FOUND", `第 ${index + 1} 个账单不存在`, 404);
@@ -854,18 +863,11 @@ export class MoneyTrackService {
           ...refundRelationshipMap(raw).keys(),
           ...reimbursementRelationshipMap(raw).keys(),
         ])];
-        if (relatedBillIds.length > 0 && !deletions[index]!.cascadeRelatedBills) {
-          throw new AppError(
-            "RELATED_BILLS_EXIST",
-            `账单 ${id} 存在 ${relatedBillIds.length} 条退款或报销关联账单，本次未执行删除，请先取得用户对删除源账单及全部关联账单的明确确认，再将该删除项的 cascadeRelatedBills 设为 true 重试`,
-          );
-        }
         if (relatedBillIds.length > 0 && ![0, 5].includes(Number(raw.type))) {
           throw new AppError("BILL_SCENARIO_UNSUPPORTED", "关联删除只支持普通支出或待报销支出源账单");
         }
         expanded.add(id);
-        if (deletions[index]!.cascadeRelatedBills) for (const relatedId of relatedBillIds) expanded.add(relatedId);
-        deleted.push({ billId: id, relatedBillIds: deletions[index]!.cascadeRelatedBills ? relatedBillIds : [] });
+        for (const relatedId of relatedBillIds) expanded.add(relatedId);
       }
       return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
         const expandedIds = [...expanded];
@@ -877,12 +879,12 @@ export class MoneyTrackService {
         ));
         if (remaining.some(Boolean)) throw writeConfirmationFailed("批量删除后同步仍发现账单");
         await this.store.invalidateCatalogCache(account.id, "assets", "");
-        return { deleted };
+        return { deleted: true };
       });
     });
   }
 
-  /** 基于缓存中的普通支出创建退款，并保存钱迹返回的完整关联账单组。 */
+  /** 基于缓存中的普通支出创建退款，并保存钱迹返回的完整关联账单组 */
   async createRefund(accountId: number, input: CreateRefundInput): Promise<Record<string, unknown>> {
     return this.withBillAccount(accountId, async (account) => {
       const sourceId = normalizeBillId(input.sourceBillId);
@@ -950,7 +952,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 根据本地缓存推导源账单关系并更新一条退款。 */
+  /** 根据本地缓存推导源账单关系并更新一条退款 */
   async updateRefund(
     accountId: number,
     refundBillId: BillIdInput,
@@ -1030,25 +1032,19 @@ export class MoneyTrackService {
     });
   }
 
-  /** 删除一条退款子账单，并确认源账单中的关联关系已移除。 */
-  async deleteRefund(
-    accountId: number,
-    refundBillId: BillIdInput,
-  ): Promise<{ deleted: true; refundBillId: string }> {
-    const refundId = await this.deleteRelatedBill(accountId, refundBillId, "refund");
-    return { deleted: true, refundBillId: refundId };
+  /** 删除一条退款子账单，并确认源账单中的关联关系已移除 */
+  async deleteRefund(accountId: number, refundBillId: BillIdInput): Promise<{ deleted: true }> {
+    await this.deleteRelatedBill(accountId, refundBillId, "refund");
+    return { deleted: true };
   }
 
-  /** 删除一条报销入账子账单，并确认同源的其他报销关系保持不变。 */
-  async deleteReimbursement(
-    accountId: number,
-    reimbursementBillId: BillIdInput,
-  ): Promise<{ deleted: true; reimbursementBillId: string }> {
-    const reimbursementId = await this.deleteRelatedBill(accountId, reimbursementBillId, "reimbursement");
-    return { deleted: true, reimbursementBillId: reimbursementId };
+  /** 删除一条报销入账子账单，并确认同源的其他报销关系保持不变 */
+  async deleteReimbursement(accountId: number, reimbursementBillId: BillIdInput): Promise<{ deleted: true }> {
+    await this.deleteRelatedBill(accountId, reimbursementBillId, "reimbursement");
+    return { deleted: true };
   }
 
-  /** 删除单条退款或报销子账单，并确认对应源关系已移除。 */
+  /** 删除单条退款或报销子账单，并确认对应源关系已移除 */
   private async deleteRelatedBill(
     accountId: number,
     relatedBillId: BillIdInput,
@@ -1103,7 +1099,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 将一条或多条 type 5 源账单作为一次计入配额的业务写入完成报销。 */
+  /** 将一条或多条 type 5 源账单作为一次计入配额的业务写入完成报销 */
   async reimburseBills(
     accountId: number,
     input: ReimburseBillsInput,
@@ -1270,11 +1266,11 @@ export class MoneyTrackService {
     });
   }
 
-  /** 使用源账单 ID 取消报销，并确认所有报销子账单均已删除。 */
+  /** 使用源账单 ID 取消报销，并确认所有报销子账单均已删除 */
   async cancelReimbursements(
     accountId: number,
     sourceBillIds: BillIdInput[],
-  ): Promise<{ cancelled: true; sourceBillIds: string[] }> {
+  ): Promise<{ cancelled: true }> {
     return this.withBillAccount(accountId, async (account) => {
       if (sourceBillIds.length === 0) throw new AppError("INVALID_SOURCE_BILLS", "sourceBillIds 不能为空");
       const ids = sourceBillIds.map(normalizeBillId);
@@ -1306,12 +1302,12 @@ export class MoneyTrackService {
           throw writeConfirmationFailed("取消报销后同步仍发现报销子账单");
         }
         await this.store.invalidateCatalogCache(account.id, "assets", "");
-        return { cancelled: true, sourceBillIds: ids };
+        return { cancelled: true };
       });
     });
   }
 
-  /** 使用共用上游结构创建转账或信用卡还款。 */
+  /** 使用共用上游结构创建转账或信用卡还款 */
   async createTransfer(
     accountId: number,
     input: CreateTransferInput,
@@ -1385,7 +1381,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 更新转账或信用卡还款，除非显式指定，否则保持原业务场景。 */
+  /** 更新转账或信用卡还款，除非显式指定，否则保持原业务场景 */
   async updateTransfer(
     accountId: number,
     billId: BillIdInput,
@@ -1412,7 +1408,7 @@ export class MoneyTrackService {
       const currentInputMoney = inputBillMoney(raw.money, currentAdjustment);
       const currentCurrency = publicCurrencyConversion(raw);
       const inputMoney = patch.money ?? currentInputMoney;
-      // 钱迹用同一有符号字段表示优惠或手续费，修改其中一个时必须清除另一个。
+      // 钱迹用同一有符号字段表示优惠或手续费，修改其中一个时必须清除另一个
       const adjustment = patch.money !== undefined || patch.fee !== undefined || patch.discount !== undefined
         ? billAdjustment(
             inputMoney,
@@ -1518,7 +1514,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 统一执行标签上限、非 VIP 配额预占及远端成功后的配额保留。 */
+  /** 统一执行标签上限、非 VIP 配额预占及远端成功后的配额保留 */
   private async withBusinessWrite<T>(
     account: QianjiAccount,
     tagIds: string[],
@@ -1531,10 +1527,10 @@ export class MoneyTrackService {
     }
     if (vip) return operation(() => {});
 
-    const date = shanghaiDate(this.now());
+    const date = zoneDateKey(Math.floor(this.now() / 1000), account.timeZone);
     await this.store.reserveWriteQuota(account.id, date, DAILY_WRITE_LIMIT);
-    // 配额统计钱迹已接受的写入，因此本地确认失败时也不能释放名额。
-    // ponytail: 接受前崩溃最多占用一个名额到上海午夜，实际发生后再引入持久化写入日志。
+    // 配额统计钱迹已接受的写入，因此本地确认失败时也不能释放名额
+    // ponytail: 接受前崩溃最多占用一个名额到账号时区的午夜，实际发生后再引入持久化写入日志
     let remoteSucceeded = false;
     try {
       return await operation(() => { remoteSucceeded = true; });
@@ -1543,7 +1539,7 @@ export class MoneyTrackService {
     }
   }
 
-  /** 在唯一入口处保留部分成功配额、刷新本地状态并返回逐项结果。 */
+  /** 在唯一入口处保留部分成功配额、刷新本地状态并返回逐项结果 */
   private async acceptSyncBillResult(
     account: QianjiAccount,
     result: SyncBillResult,
@@ -1568,7 +1564,7 @@ export class MoneyTrackService {
     throw inspected.error;
   }
 
-  /** 将远端写入后的本地确认失败转换为可恢复的稳定错误。 */
+  /** 将远端写入后的本地确认失败转换为可恢复的稳定错误 */
   private async confirmWrite(confirm: () => Promise<void>): Promise<void> {
     try {
       await confirm();
@@ -1577,7 +1573,7 @@ export class MoneyTrackService {
     }
   }
 
-  /** 保存上游返回的关联账单并立即同步最终状态。 */
+  /** 保存上游返回的关联账单并立即同步最终状态 */
   private async saveConfirmedBillsAndSync(
     account: QianjiAccount,
     bills: Record<string, unknown>[],
@@ -1586,21 +1582,21 @@ export class MoneyTrackService {
     await this.syncUnlocked(account);
   }
 
-  /** 立即拒绝登录初始化期间的账单操作，并在后台失败后提供显式恢复动作。 */
+  /** 立即拒绝登录初始化期间的账单操作，并在后台失败后提供显式恢复动作 */
   private requireDataSyncIdle(accountId: number): void {
     this.requireDataSyncNotRunning(accountId);
     const failure = this.initialSyncFailures.get(accountId);
     if (failure) throw failure;
   }
 
-  /** 立即拒绝仍在进行的登录初始化。 */
+  /** 立即拒绝仍在进行的登录初始化 */
   private requireDataSyncNotRunning(accountId: number): void {
     if (this.initializingAccounts.has(accountId)) {
       throw new AppError("QIANJI_DATA_SYNCING", "钱迹账单正在同步，请稍后再试", 409);
     }
   }
 
-  /** 在首次同步门禁内串行执行账单操作。 */
+  /** 在首次同步门禁内串行执行账单操作 */
   private async withBillAccount<T>(
     accountId: number,
     operation: (account: QianjiAccount) => Promise<T>,
@@ -1612,7 +1608,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 登录成功后启动一次后台账单同步，并保留失败供后续调用显式处理。 */
+  /** 登录成功后启动一次后台账单同步，并保留失败供后续调用显式处理 */
   private startInitialSync(accountId: number): void {
     if (this.initialSyncs.has(accountId)) return;
     this.initializingAccounts.add(accountId);
@@ -1628,7 +1624,7 @@ export class MoneyTrackService {
     this.initialSyncs.set(accountId, task);
   }
 
-  /** 将后台同步异常转换为不会泄露内部信息的稳定恢复错误。 */
+  /** 将后台同步异常转换为不会泄露内部信息的稳定恢复错误 */
   private initialSyncFailure(error: unknown): AppError {
     const cause = safeError(error);
     return cause.code === "QIANJI_TOKEN_INVALID"
@@ -1640,23 +1636,23 @@ export class MoneyTrackService {
         );
   }
 
-  /** 在账号级串行锁内重新读取绑定，避免使用过期的请求期账号快照。 */
+  /** 在账号级串行锁内重新读取绑定，避免使用过期的请求期账号快照 */
   private async withAccount<T>(
     accountId: number,
     operation: (account: QianjiAccount) => Promise<T>,
   ): Promise<T> {
-    // ponytail: 进程内账号锁符合单实例约束，支持多副本前改用数据库级锁。
+    // ponytail: 进程内账号锁符合单实例约束，支持多副本前改用数据库级锁
     return this.withLock(`account:${accountId}`, async () => operation(await this.store.requireAccount(accountId)));
   }
 
-  /** 使用 Promise 尾链串行执行同一键的任务，并在队列耗尽后释放锁记录。 */
+  /** 使用 Promise 尾链串行执行同一键的任务，并在队列耗尽后释放锁记录 */
   private async withLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(key) ?? Promise.resolve();
     let release = (): void => {};
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
-    // 新任务先挂到当前尾部，再等待前序完成，这样并发调用不会同时越过锁。
+    // 新任务先挂到当前尾部，再等待前序完成，这样并发调用不会同时越过锁
     const tail = previous.then(() => current);
     this.locks.set(key, tail);
     await previous;
@@ -1668,7 +1664,7 @@ export class MoneyTrackService {
     }
   }
 
-  /** 拉取完整增量分页，并把数据变化与最终游标作为一个事务提交。 */
+  /** 拉取完整增量分页，并把数据变化与最终游标作为一个事务提交 */
   private async syncUnlocked(account: QianjiAccount): Promise<void> {
     const initialLasttimes = await this.store.getSyncState(account.id);
     let bookid = GLOBAL_SYNC_BOOK_ID;
@@ -1678,7 +1674,7 @@ export class MoneyTrackService {
     const seen = new Set<string>();
     const pages: PullPage[] = [];
 
-    // 先在内存中收齐所有分页，避免部分分页与中间游标提前落库。
+    // 先在内存中收齐所有分页，避免部分分页与中间游标提前落库
     while (true) {
       let page: PullPage;
       try {
@@ -1733,7 +1729,7 @@ export class MoneyTrackService {
     }
   }
 
-  /** 读取目录缓存，过期时刷新，并按调用方策略决定是否允许使用陈旧快照。 */
+  /** 读取目录缓存，过期时刷新，并按调用方策略决定是否允许使用陈旧快照 */
   private async loadCatalog(
     account: QianjiAccount,
     kind: CatalogKind,
@@ -1753,7 +1749,7 @@ export class MoneyTrackService {
     }
   }
 
-  /** 读取用户缓存，过期时通过客户端初始化接口同时刷新用户和账本。 */
+  /** 读取用户缓存，过期时通过客户端初始化接口同时刷新用户和账本 */
   private async loadUser(
     account: QianjiAccount,
     forceRefresh = false,
@@ -1774,7 +1770,7 @@ export class MoneyTrackService {
     }
   }
 
-  /** 旧用户快照不含币种配置时强制初始化一次，避免猜测本位币。 */
+  /** 旧用户快照不含币种配置时强制初始化一次，避免猜测本位币 */
   private async loadUserWithCurrencyConfig(account: QianjiAccount): Promise<Record<string, unknown>> {
     const user = await this.loadUser(account);
     return isCurrencySymbol(String(user.__baseCurrency ?? ""))
@@ -1782,7 +1778,7 @@ export class MoneyTrackService {
       : this.loadUser(account, true, false);
   }
 
-  /** 读取完整账本目录，隐藏过滤由公开读取方法负责。 */
+  /** 读取完整账本目录，隐藏过滤由公开读取方法负责 */
   private loadBooks(
     account: QianjiAccount,
     options?: CatalogOptions,
@@ -1790,7 +1786,7 @@ export class MoneyTrackService {
     return this.loadCatalog(account, "books", "", () => this.client.listBooks(account, true), options);
   }
 
-  /** 读取完整资产目录，隐藏过滤由公开读取方法负责。 */
+  /** 读取完整资产目录，隐藏过滤由公开读取方法负责 */
   private loadAssets(
     account: QianjiAccount,
     options?: CatalogOptions,
@@ -1798,7 +1794,7 @@ export class MoneyTrackService {
     return this.loadCatalog(account, "assets", "", () => this.client.listAssets(account, true), options);
   }
 
-  /** 读取仅供跨币种校验和换算使用的内部币种目录。 */
+  /** 读取仅供跨币种校验和换算使用的内部币种目录 */
   private loadCurrencies(
     account: QianjiAccount,
     options?: CatalogOptions,
@@ -1806,7 +1802,7 @@ export class MoneyTrackService {
     return this.loadCatalog(account, "currencies", "", () => this.client.listCurrencies(account), options);
   }
 
-  /** 按 APP 的普通账单本地增量语义更新已有资产快照，不触发资产接口刷新。 */
+  /** 按 APP 的普通账单本地增量语义更新已有资产快照，不触发资产接口刷新 */
   private async updateCachedCommonBillAssets(
     accountId: number,
     previous: Record<string, unknown> | undefined,
@@ -1840,7 +1836,7 @@ export class MoneyTrackService {
     await this.store.setCatalogCache(accountId, "assets", "", data, cached.refreshedAtMs);
   }
 
-  /** 读取指定账本的完整分类目录。 */
+  /** 读取指定账本的完整分类目录 */
   private loadCategories(
     account: QianjiAccount,
     bookId: string,
@@ -1855,7 +1851,7 @@ export class MoneyTrackService {
     );
   }
 
-  /** 读取包含正常和归档标签的完整目录。 */
+  /** 读取包含正常和归档标签的完整目录 */
   private loadTags(
     account: QianjiAccount,
     options?: CatalogOptions,
@@ -1869,7 +1865,7 @@ export class MoneyTrackService {
     );
   }
 
-  /** 验证账本归属，新账本未命中时强制刷新一次以排除陈旧缓存。 */
+  /** 验证账本归属，新账本未命中时强制刷新一次以排除陈旧缓存 */
   private async requireBook(
     account: QianjiAccount,
     bookId: string,
@@ -1888,7 +1884,7 @@ export class MoneyTrackService {
     throw crossAccount("账本");
   }
 
-  /** 拒绝官方标记为成员到期，或所有者 VIP 到期后的非默认账本写入。 */
+  /** 拒绝官方标记为成员到期，或所有者 VIP 到期后的非默认账本写入 */
   private async requireWritableBook(account: QianjiAccount, bookId: string): Promise<void> {
     const book = await this.requireBook(account, bookId, { allowStale: false });
     if (!book) return;
@@ -1904,7 +1900,7 @@ export class MoneyTrackService {
     if (!isVip(user, this.now())) throw new AppError("BOOK_EXPIRED", "该非默认账本已随 VIP 到期，不能继续写入");
   }
 
-  /** 判断目录缓存是否有效，并排除已过期的外部成员账本快照。 */
+  /** 判断目录缓存是否有效，并排除已过期的外部成员账本快照 */
   private isCatalogFresh(account: QianjiAccount, kind: CatalogKind, cached?: CatalogCache): boolean {
     if (!cached || cached.data.length === 0 || this.now() - cached.refreshedAtMs >= CATALOG_TTL_MS[kind]) return false;
     return kind !== "books" || !cached.data.some((book) =>
@@ -1912,7 +1908,7 @@ export class MoneyTrackService {
     );
   }
 
-  /** 并行加载普通账单写入所需的资产、分类和标签目录。 */
+  /** 并行加载普通账单写入所需的资产、分类和标签目录 */
   private async loadWriteReferences(
     account: QianjiAccount,
     bookId: string,
@@ -1927,7 +1923,7 @@ export class MoneyTrackService {
     return { assets, categories, tags };
   }
 
-  /** 校验普通账单引用归属，首次失败后强制刷新一次以排除缓存陈旧。 */
+  /** 校验普通账单引用归属，首次失败后强制刷新一次以排除缓存陈旧 */
   private async validateWriteReferences(
     account: QianjiAccount,
     bookId: string,
@@ -1949,7 +1945,7 @@ export class MoneyTrackService {
     );
   }
 
-  /** 引用未命中时强制刷新目录一次并重新校验。 */
+  /** 引用未命中时强制刷新目录一次并重新校验 */
   private async validateAfterCatalogRefresh<T, R>(
     load: (forceRefresh: boolean) => Promise<T>,
     validate: (references: T) => R,
@@ -1962,7 +1958,7 @@ export class MoneyTrackService {
     }
   }
 
-  /** 对已加载的目录执行分类类型、资产和标签归属校验。 */
+  /** 对已加载的目录执行分类类型、资产和标签归属校验 */
   private validateReferences(
     references: ReferenceCatalog,
     type: 0 | 1,
@@ -1980,7 +1976,7 @@ export class MoneyTrackService {
     if (tagIds.some((tagId) => !availableTags.has(tagId))) throw crossAccount("标签");
   }
 
-  /** 并行加载退款、报销和转账共用的资产与标签目录。 */
+  /** 并行加载退款、报销和转账共用的资产与标签目录 */
   private async loadAssetAndTagReferences(
     account: QianjiAccount,
     forceRefresh = false,
@@ -1993,7 +1989,7 @@ export class MoneyTrackService {
     return { assets, tags };
   }
 
-  /** 校验资产和标签归属，首次失败后强制刷新一次目录。 */
+  /** 校验资产和标签归属，首次失败后强制刷新一次目录 */
   private async validateAssetAndTags(account: QianjiAccount, assetId: string, tagIds: string[]): Promise<void> {
     const validate = ({ assets, tags }: { assets: Record<string, unknown>[]; tags: Record<string, unknown>[] }): void => {
       if (assetId !== "-1" && !assets.some((asset) => String(asset.id) === assetId)) throw crossAccount("资产");
@@ -2014,7 +2010,7 @@ export class MoneyTrackService {
     return this.resolvedAssetCurrency(account, asset);
   }
 
-  /** 按 APK 规则解析资产币种，原始值为空时使用账号本位币。 */
+  /** 按 APK 规则解析资产币种，原始值为空时使用账号本位币 */
   private async resolvedAssetCurrency(account: QianjiAccount, asset: Record<string, unknown>): Promise<string> {
     const baseCurrency = String(asset.currency ?? "").trim()
       ? ""
@@ -2022,7 +2018,7 @@ export class MoneyTrackService {
     return publicAssetCurrency(asset, baseCurrency);
   }
 
-  /** 历史换算优先，无换算且无资产时按 APP 语义使用本位币。 */
+  /** 历史换算优先，无换算且无资产时按 APP 语义使用本位币 */
   private async billSourceCurrency(account: QianjiAccount, raw: Record<string, unknown>): Promise<string> {
     return String(
       publicCurrencyConversion(raw)?.sourceCurrency ??
@@ -2031,7 +2027,7 @@ export class MoneyTrackService {
     );
   }
 
-  /** 校验转账双方资产、币种、信用账户要求及标签归属。 */
+  /** 校验转账双方资产、币种、信用账户要求及标签归属 */
   private async validateTransferReferences(
     account: QianjiAccount,
     bookId: string,
@@ -2064,7 +2060,7 @@ export class MoneyTrackService {
     );
   }
 
-  /** 构造 APK `CurrencyExtra`，显式金额优先，省略时才按内部币种目录换算。 */
+  /** 构造 APK `CurrencyExtra`，显式金额优先，省略时才按内部币种目录换算 */
   private async buildCurrencyExtra(
     account: QianjiAccount,
     sourceCurrencyInput: string,
@@ -2091,7 +2087,7 @@ export class MoneyTrackService {
       return undefined;
     }
     if (user.__multiCurrencyEnabled !== true) {
-      throw new AppError("MULTI_CURRENCY_DISABLED", "当前钱迹账户未开启多币种，请先在钱迹 APP 开启后调用 refresh_cache 重试");
+      throw new AppError("MULTI_CURRENCY_DISABLED", "当前钱迹账户未开启多币种，请先在钱迹客户端开启后调用 refresh_cache 重试");
     }
     requirePositiveMoney(sourceAmount, "来源金额");
     if (input?.targetAmount !== undefined) requireNonnegativeMoney(input.targetAmount, "目标金额");
@@ -2130,7 +2126,7 @@ export class MoneyTrackService {
       : !transfer && adjustment < 0
         ? decimalAdd(sourceAmount, adjustment)
         : sourceAmount;
-    // APK 先用 HALF_UP 将汇率保留 10 位，再用 HALF_EVEN 将转换金额格式化为两位小数。
+    // APK 先用 HALF_UP 将汇率保留 10 位，再用 HALF_EVEN 将转换金额格式化为两位小数
     const convertedAmount = (target: string): number => {
       const rate = decimalDivide(price(sourceCurrency), price(target), 10);
       return binaryRound(decimalMultiply(effectiveTargetAmount, rate), 2);
@@ -2150,12 +2146,13 @@ export class MoneyTrackService {
   }
 }
 
-/** 构造公开用户资料，并为非 VIP 用户附加当天写入配额。 */
+/** 构造公开用户资料，并为非 VIP 用户附加当天写入配额 */
 async function publicUser(
   user: Record<string, unknown>,
   store: DataStore,
   accountId: number,
   nowMs: number,
+  timeZone: string,
 ): Promise<Record<string, unknown>> {
   const vip = isVip(user, nowMs);
   const result: Record<string, unknown> = {
@@ -2163,6 +2160,7 @@ async function publicUser(
     name: String(user.name ?? ""),
     avatar: String(user.avatar ?? ""),
     registeredAt: Number(user.time ?? 0),
+    timeZone,
     vipType: vipTypeName(Number(user.viptype ?? -1)),
     vipStart: publicVipTime(user.vipstart, "生效"),
     vipEnd: publicVipTime(user.vipend, "失效"),
@@ -2173,14 +2171,15 @@ async function publicUser(
   if (registrationMethod) result.registrationMethod = registrationMethod;
   if (vip) return result;
   const quota = await store.getWriteQuota(accountId);
-  const today = shanghaiDate(nowMs);
+  const today = zoneDateKey(Math.floor(nowMs / 1000), timeZone);
   const used = quota.date === today ? quota.used : 0;
+  const { year, month, day } = zoneCalendarParts(Math.floor(nowMs / 1000), timeZone);
   return {
     ...result,
     dailyWriteLimit: DAILY_WRITE_LIMIT,
     dailyWriteUsed: used,
     dailyWriteRemaining: Math.max(0, DAILY_WRITE_LIMIT - used),
-    dailyWriteResetsAt: nextShanghaiMidnight(today),
+    dailyWriteResetsAt: zoneDayEpoch(year, month, day + 1, timeZone),
   };
 }
 
@@ -2218,7 +2217,7 @@ function normalizeCurrencySymbol(value: string, label: string): string {
   return currency;
 }
 
-/** 普通收支选择跨币种资产时，APK 将目标资产金额保存为账单主金额。 */
+/** 普通收支选择跨币种资产时，APK 将目标资产金额保存为账单主金额 */
 function storedCommonBillMoney(
   sourceStoredMoney: number,
   currency: Record<string, unknown> | undefined,
@@ -2227,7 +2226,7 @@ function storedCommonBillMoney(
   return currency && currency.ts === assetCurrency ? Number(currency.tv) : sourceStoredMoney;
 }
 
-/** 按 APK `CurrencyValues` 的编辑顺序用账单历史汇率缩放已保存换算金额。 */
+/** 按 APK `CurrencyValues` 的编辑顺序用账单历史汇率缩放已保存换算金额 */
 function rescaleCurrencyExtra(
   conversion: Record<string, unknown>,
   nextSourceAmount: number,
@@ -2285,10 +2284,9 @@ function statisticsRange(
   books: Record<string, unknown>[],
   rows: Array<{ bookid: string; time: number }>,
   nowMs: number,
+  timeZone: string,
 ): { startTime: number; endTime: number; unit: StatisticsUnit } {
-  const offset = 8 * 60 * 60;
-  const localSecond = (year: number, month: number, day: number): number =>
-    Math.floor(Date.UTC(year, month - 1, day) / 1000) - offset;
+  const localSecond = (year: number, month: number, day: number): number => zoneDayEpoch(year, month, day, timeZone);
   if (input.range.kind === "custom") {
     if (input.range.startTime > input.range.endTime) throw new AppError("INVALID_TIME_RANGE", "startTime 不能晚于 endTime");
     const days = (input.range.endTime + 1 - input.range.startTime) / 86_400;
@@ -2353,19 +2351,19 @@ function resolveBudgetPeriod(
   input: BudgetPeriod | undefined,
   range: string | undefined,
   nowMs: number,
+  timeZone: string,
 ): ResolvedBudgetPeriod {
   const startDay = budgetStartDay(range);
   let filter = input;
   if (!filter) {
-    const local = new Date(nowMs + 28_800_000);
-    let year = local.getUTCFullYear();
-    let month = local.getUTCMonth() + 1;
-    if (Math.floor(nowMs / 1000) < shanghaiSecond(year, month, startDay)) {
+    const now = Math.floor(nowMs / 1000);
+    const { year, month } = zoneCalendarParts(now, timeZone);
+    if (now < zoneDayEpoch(year, month, startDay, timeZone)) {
       const previous = new Date(Date.UTC(year, month - 2, 1));
-      year = previous.getUTCFullYear();
-      month = previous.getUTCMonth() + 1;
+      filter = { kind: "month", year: previous.getUTCFullYear(), month: previous.getUTCMonth() + 1 };
+    } else {
+      filter = { kind: "month", year, month };
     }
-    filter = { kind: "month", year, month };
   }
   if (!Number.isInteger(filter.year) || filter.year < 1970 || filter.year > 9999) {
     throw new AppError("INVALID_BUDGET_PERIOD", "预算年份必须是 1970 到 9999 之间的整数");
@@ -2374,18 +2372,18 @@ function resolveBudgetPeriod(
     if (!Number.isInteger(filter.month) || filter.month < 1 || filter.month > 12) {
       throw new AppError("INVALID_BUDGET_PERIOD", "预算月份必须是 1 到 12 之间的整数");
     }
-    const startTime = shanghaiSecond(filter.year, filter.month, startDay);
+    const startTime = zoneDayEpoch(filter.year, filter.month, startDay, timeZone);
     return {
       filter,
       startTime,
-      endTime: shanghaiSecond(filter.year, filter.month + 1, startDay) - 1,
+      endTime: zoneDayEpoch(filter.year, filter.month + 1, startDay, timeZone) - 1,
     };
   }
   if (filter.kind !== "year") throw new AppError("INVALID_BUDGET_PERIOD", "预算期间只支持月份或年份");
   return {
     filter,
-    startTime: shanghaiSecond(filter.year, 1, 1),
-    endTime: shanghaiSecond(filter.year + 1, 1, 1) - 1,
+    startTime: zoneDayEpoch(filter.year, 1, 1, timeZone),
+    endTime: zoneDayEpoch(filter.year + 1, 1, 1, timeZone) - 1,
   };
 }
 
@@ -2398,12 +2396,6 @@ function budgetStartDay(range: string | undefined): number {
   return day;
 }
 
-function shanghaiSecond(year: number, month: number, day: number): number {
-  const time = Date.UTC(year, month - 1, day) / 1000 - 28_800;
-  if (!Number.isFinite(time)) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹账本月份范围无效", 502);
-  return Math.floor(time);
-}
-
 function calculateBudget(options: {
   budgets: Record<string, unknown>[];
   categories: Record<string, unknown>[];
@@ -2413,6 +2405,7 @@ function calculateBudget(options: {
   currency: string;
   includeDailyStatistics: boolean;
   nowMs: number;
+  timeZone: string;
 }): Record<string, unknown> {
   const categoryIndex = new Map<string, { name: string; parentId?: string }>();
   for (const category of options.categories) indexBudgetCategory(categoryIndex, category);
@@ -2465,7 +2458,7 @@ function calculateBudget(options: {
     ...options.period.filter,
     startTime: options.period.startTime,
     endTime: options.period.endTime,
-    timezoneOffsetSeconds: 28_800,
+    timezoneOffsetSeconds: zoneOffsetSeconds(options.timeZone, Math.floor(options.nowMs / 1000)),
   };
   if (!configured) {
     return {
@@ -2504,7 +2497,7 @@ function calculateBudget(options: {
     }
     const included = spendingScope === "allExpenses" || (categoryRoot !== undefined && selectedRoots.has(categoryRoot));
     if (included && amounts.spend > 0) {
-      const day = Math.floor((row.time + 28_800) / 86_400) * 86_400 - 28_800;
+      const day = zoneDayStart(row.time, options.timeZone);
       dailySpend.set(day, decimalAdd(dailySpend.get(day) ?? 0, amounts.spend));
     }
   }
@@ -2521,10 +2514,14 @@ function calculateBudget(options: {
   const limit = Math.max(fullLimit, totalCategoryLimit);
   const used = spendingScope === "allExpenses" ? allSpend : categorySpend;
   const remaining = decimalSubtract(limit, used);
-  const totalDays = (options.period.endTime + 1 - options.period.startTime) / 86_400;
+  // 日历日计数不受夏令时影响，DST 期间的 23 或 25 小时日也按整天计入
+  const startDay = zoneCalendarParts(options.period.startTime, options.timeZone);
+  const endDay = zoneCalendarParts(options.period.endTime, options.timeZone);
+  const totalDays = (Date.UTC(endDay.year, endDay.month - 1, endDay.day) - Date.UTC(startDay.year, startDay.month - 1, startDay.day)) / 86_400_000 + 1;
   const now = Math.floor(options.nowMs / 1000);
+  const nowDay = zoneCalendarParts(now, options.timeZone);
   const remainingDays = options.period.filter.kind === "month" && now >= options.period.startTime && now <= options.period.endTime
-    ? Math.floor((options.period.endTime - now) / 86_400) + 1
+    ? Math.floor((Date.UTC(endDay.year, endDay.month - 1, endDay.day) - Date.UTC(nowDay.year, nowDay.month - 1, nowDay.day)) / 86_400_000) + 1
     : 0;
   const summary: Record<string, unknown> = {
     spendingScope,
@@ -2542,7 +2539,7 @@ function calculateBudget(options: {
     summary,
     categories,
     ...(options.includeDailyStatistics
-      ? { dailyStatistics: publicBudgetDays(options.period, limit, dailySpend) }
+      ? { dailyStatistics: publicBudgetDays(options.period, limit, dailySpend, options.timeZone) }
       : {}),
   };
 }
@@ -2602,26 +2599,30 @@ function publicBudgetDays(
   period: ResolvedBudgetPeriod,
   limit: number,
   spending: Map<number, number>,
+  timeZone: string,
 ): Record<string, unknown>[] {
   const result: Record<string, unknown>[] = [];
   let cumulativeSpend = 0;
-  for (let time = period.startTime; time <= period.endTime; time += 86_400) {
-    const spend = spending.get(time) ?? 0;
+  // 按日历日步进而非固定 86400 秒，夏令时切换日自然形成 23 或 25 小时的一天
+  let cursor = zoneDayStart(period.startTime, timeZone);
+  while (cursor <= period.endTime) {
+    const spend = spending.get(cursor) ?? 0;
     cumulativeSpend = decimalAdd(cumulativeSpend, spend);
-    const date = new Date((time + 28_800) * 1000);
     result.push({
-      date: `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`,
+      date: zoneDateKey(cursor, timeZone),
       spend,
       cumulativeSpend,
       remaining: decimalSubtract(limit, cumulativeSpend),
     });
+    const { year, month, day } = zoneCalendarParts(cursor, timeZone);
+    cursor = zoneDayEpoch(year, month, day + 1, timeZone);
   }
   return result;
 }
 
-/** 将钱迹平台注册代码映射为不含联系方式的注册方式。 */
+/** 将钱迹平台注册代码映射为不含联系方式的注册方式 */
 function registrationMethodName(platform: number): string | undefined {
-  // APK 对 2/6 返回手机号或邮箱原文，这里只披露注册方式，避免暴露联系方式。
+  // APK 对 2/6 返回手机号或邮箱原文，这里只披露注册方式，避免暴露联系方式
   return platform === 2 ? "手机号"
     : platform === 3 ? "微博"
     : platform === 5 ? "QQ"
@@ -2632,9 +2633,9 @@ function registrationMethodName(platform: number): string | undefined {
     : undefined;
 }
 
-/** 将钱迹 VIP 类型代码映射为稳定的中文名称。 */
+/** 将钱迹 VIP 类型代码映射为稳定的中文名称 */
 function vipTypeName(type: number): string {
-  // 名称与已审计 APK 的 User.getVipName 保持一致，未知正数代码只公开为通用 VIP。
+  // 名称与已审计 APK 的 User.getVipName 保持一致，未知正数代码只公开为通用 VIP
   return type === 1 ? "试用"
     : type === 2 ? "单月VIP"
     : type === 3 ? "6个月VIP"
@@ -2644,7 +2645,7 @@ function vipTypeName(type: number): string {
     : "未开通";
 }
 
-/** 根据 VIP 类型和有效期判断指定时刻是否具备 VIP 权益。 */
+/** 根据 VIP 类型和有效期判断指定时刻是否具备 VIP 权益 */
 function isVip(user: Record<string, unknown>, nowMs: number): boolean {
   const now = Math.floor(nowMs / 1000);
   const type = Number(user.viptype ?? -1);
@@ -2653,23 +2654,7 @@ function isVip(user: Record<string, unknown>, nowMs: number): boolean {
   return type >= 1 && now >= start && now < end;
 }
 
-/** 将时间戳转换为上海时区的自然日字符串。 */
-function shanghaiDate(epochMs: number): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(epochMs);
-}
-
-/** 计算指定上海自然日下一次午夜的 Unix 秒。 */
-function nextShanghaiMidnight(date: string): number {
-  const [year, month, day] = date.split("-").map(Number);
-  return Math.floor((Date.UTC(year!, month! - 1, day! + 1) - 8 * 60 * 60 * 1000) / 1000);
-}
-
-/** 构造远端已写入但本地无法确认时的可恢复错误。 */
+/** 构造远端已写入但本地无法确认时的可恢复错误 */
 function writeConfirmationFailed(detail: string): AppError {
   return new AppError(
     "WRITE_CONFIRMATION_FAILED",
@@ -2678,13 +2663,24 @@ function writeConfirmationFailed(detail: string): AppError {
   );
 }
 
-/** 将受账号和筛选条件约束的分页状态编码为连续十六进制游标。 */
+/** 将受账号和筛选条件约束的分页状态编码为连续十六进制游标 */
 function encodeCursor(cursor: CursorPayload): string {
-  return `c_${Buffer.from(JSON.stringify(cursor)).toString("hex")}`;
+  const encoded = `c_${Buffer.from(JSON.stringify(cursor)).toString("hex")}`;
+  assertCursorWithinLimit(encoded);
+  return encoded;
 }
 
 function encodeAdvancedCursor(cursor: AdvancedCursorPayload): string {
-  return `c3_${Buffer.from(JSON.stringify(cursor)).toString("hex")}`;
+  const encoded = `c3_${Buffer.from(JSON.stringify(cursor)).toString("hex")}`;
+  assertCursorWithinLimit(encoded);
+  return encoded;
+}
+
+/** 兜底断言发出的游标满足自身的输入契约，输入长度边界内的正常请求不可达 */
+function assertCursorWithinLimit(encoded: string): void {
+  if (encoded.length > MAX_BILL_CURSOR_LENGTH) {
+    throw new AppError("CURSOR_LENGTH_EXCEEDED", "分页游标超出长度上限，请收窄筛选条件", 500);
+  }
 }
 
 function decodeAdvancedCursor(cursor: string, accountId: number): AdvancedCursorPayload {
@@ -2704,11 +2700,11 @@ function decodeAdvancedCursor(cursor: string, accountId: number): AdvancedCursor
   }
 }
 
-/** 解码并完整校验分页游标，防止跨账号或非法筛选状态复用。 */
+/** 解码并完整校验分页游标，防止跨账号或非法筛选状态复用 */
 function decodeCursor(cursor: string, accountId: number): CursorPayload {
   try {
     if (cursor.length > MAX_BILL_CURSOR_LENGTH) throw new Error();
-    // PAT 认证是信任边界，游标无需签名，但必须锁定账号并逐字段校验查询范围。
+    // PAT 认证是信任边界，游标无需签名，但必须锁定账号并逐字段校验查询范围
     const encoded = cursor.startsWith("c_") ? cursor.slice(2) : cursor;
     const encoding = cursor.startsWith("c_") ? "hex" : "base64url";
     const value = JSON.parse(Buffer.from(encoded, encoding).toString("utf8")) as Partial<CursorPayload>;
@@ -2730,7 +2726,7 @@ function decodeCursor(cursor: string, accountId: number): CursorPayload {
       (value.createStartTime !== undefined && value.createEndTime !== undefined && value.createStartTime > value.createEndTime) ||
       (value.type !== undefined && (!Number.isInteger(value.type) || !KNOWN_BILL_TYPES.has(value.type))) ||
       (value.categoryId !== undefined && !isPositiveLongId(value.categoryId)) ||
-      (value.tagId !== undefined && (typeof value.tagId !== "string" || value.tagId.length === 0)) ||
+      (value.tagId !== undefined && (typeof value.tagId !== "string" || value.tagId.length === 0 || value.tagId.length > MAX_OPAQUE_ID_LENGTH)) ||
       (value.remarkKeyword !== undefined && (typeof value.remarkKeyword !== "string" || value.remarkKeyword.trim().length === 0 || value.remarkKeyword.length > MAX_SEARCH_KEYWORD_LENGTH)) ||
       (value.assetId !== undefined && (typeof value.assetId !== "string" || !isOptionalPositiveLongId(value.assetId))) ||
       (value.fromAssetId !== undefined && (typeof value.fromAssetId !== "string" || !isOptionalPositiveLongId(value.fromAssetId))) ||
@@ -2744,7 +2740,7 @@ function decodeCursor(cursor: string, accountId: number): CursorPayload {
   }
 }
 
-/** 验证可被调用方篡改的高级游标内容，边界与 MCP 输入 schema 一致。 */
+/** 验证可被调用方篡改的高级游标内容，边界与 MCP 输入 schema 一致 */
 function validAdvancedCursorFilters(value: unknown): value is Omit<ListBillsInput, "cursor" | "limit"> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const filters = value as Record<string, unknown>;
@@ -2768,27 +2764,29 @@ function validAdvancedCursorFilters(value: unknown): value is Omit<ListBillsInpu
     typeof candidate === "string" && candidate.trim().length > 0 && candidate.length <= max;
   const knownType = (candidate: unknown): boolean => typeof candidate === "number" && Number.isInteger(candidate) && KNOWN_BILL_TYPES.has(candidate);
   const bool = (candidate: unknown): boolean => typeof candidate === "boolean";
+  const opaqueId = (candidate: unknown): boolean =>
+    typeof candidate === "string" && candidate.length > 0 && candidate.length <= MAX_OPAQUE_ID_LENGTH;
   return optional("bookId", referenceId) && optional("allBooks", bool) &&
     optional("startTime", time) && optional("endTime", time) &&
     optional("createStartTime", time) && optional("createEndTime", time) &&
     optional("type", knownType) && list("types", knownType) &&
     optional("minMoney", money) && optional("maxMoney", money) &&
     optional("categoryId", id) && list("categoryIds", id) && optional("includeSubcategories", bool) &&
-    optional("tagId", (candidate) => typeof candidate === "string" && candidate.length > 0) &&
-    list("tagIds", (candidate) => typeof candidate === "string" && candidate.length > 0) &&
+    optional("tagId", opaqueId) &&
+    list("tagIds", opaqueId) &&
     optional("tagMatch", (candidate) => candidate === "any" || candidate === "all") &&
     optional("remarkKeyword", (candidate) => text(candidate, MAX_SEARCH_KEYWORD_LENGTH)) &&
     optional("assetId", referenceId) && list("assetIds", id) &&
     optional("fromAssetId", referenceId) && optional("targetAssetId", referenceId) &&
     optional("source", (candidate) => [0, 2, 120, 121, 122].includes(Number(candidate)) && typeof candidate === "number") &&
-    list("memberIds", (candidate) => typeof candidate === "string" && candidate.length > 0) &&
+    list("memberIds", opaqueId) &&
     optional("currency", (candidate) => typeof candidate === "string" && isCurrencySymbol(candidate)) &&
     optional("noAsset", bool) && optional("noTags", bool) &&
     optional("excludeFromIncomeExpense", bool) && optional("excludeFromBudget", bool) &&
     optional("sort", (candidate) => typeof candidate === "string" && ["timeDesc", "timeAsc", "moneyDesc", "moneyAsc"].includes(candidate));
 }
 
-/** 判断请求是否在游标之外又显式提供了筛选或分页参数。 */
+/** 判断请求是否在游标之外又显式提供了筛选或分页参数 */
 function hasExplicitBillFilters(input: ListBillsInput): boolean {
   return input.bookId !== undefined ||
     input.allBooks !== undefined ||
@@ -2908,7 +2906,7 @@ function advancedBillMatches(
   return true;
 }
 
-/** 与账单列表输出一致的 APP 主金额，用于高级金额筛选和排序。 */
+/** 与账单列表输出一致的 APP 主金额，用于高级金额筛选和排序 */
 function billMainMoney(raw: Record<string, unknown>, storedMoney: number, type: number): number {
   const conversion = publicCurrencyConversion(raw);
   if (conversion) return Number(conversion.sourceAmount);
@@ -2924,12 +2922,12 @@ function matchesBillSource(raw: Record<string, unknown>, source: number): boolea
   return platform === source;
 }
 
-/** 判断值是否为非负整数。 */
+/** 判断值是否为非负整数 */
 function isNonnegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
-/** 按 APK 兼容规则拒绝其他用户账单，报销场景要求所有者字段严格存在。 */
+/** 按 APK 兼容规则拒绝其他用户账单，报销场景要求所有者字段严格存在 */
 function requireOwnedBill(raw: Record<string, unknown>, uid: string, exact = false): void {
   const owner = publicUserId(raw.userid);
   if ((exact && owner !== uid) || (!exact && owner !== "" && owner !== uid)) {
@@ -2937,7 +2935,7 @@ function requireOwnedBill(raw: Record<string, unknown>, uid: string, exact = fal
   }
 }
 
-/** 构造资源不适用于当前账号或业务上下文的错误。 */
+/** 构造资源不适用于当前账号或业务上下文的错误 */
 function crossAccount(resource: "账本" | "分类" | "资产" | "标签"): AppError {
   return new AppError(
     "CROSS_ACCOUNT_RESOURCE",

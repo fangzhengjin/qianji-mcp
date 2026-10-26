@@ -17,7 +17,7 @@ export interface BindingTicket {
   expiresAtMs: number;
 }
 
-/** 请求作用域内的 PAT 快照，账号操作会在执行前重新验证令牌。 */
+/** 请求作用域内的 PAT 快照，账号操作会在执行前重新验证令牌 */
 export interface AuthenticatedPat {
   token: string;
   patId: number;
@@ -26,7 +26,7 @@ export interface AuthenticatedPat {
   resource: URL;
 }
 
-/** 签发并核销仅驻留当前服务进程的一次性账号绑定凭证。 */
+/** 签发并核销仅驻留当前服务进程的一次性账号绑定凭证 */
 export class BindingTicketManager {
   private readonly records = new Map<string, BindingTicketRecord>();
   private readonly activePatIds = new Set<number>();
@@ -36,7 +36,7 @@ export class BindingTicketManager {
     this.now = now;
   }
 
-  /** 为已认证 PAT 签发十分钟有效的随机凭证，内存中只保存摘要。 */
+  /** 为已认证 PAT 签发十分钟有效的随机凭证，内存中只保存摘要 */
   issue(patId: number): BindingTicket {
     this.removeExpired();
     const token = randomBytes(32).toString("hex");
@@ -45,7 +45,7 @@ export class BindingTicketManager {
     return { token, expiresAtMs };
   }
 
-  /** 只读检查凭证当前是否有效，不占用或核销凭证。 */
+  /** 只读检查凭证当前是否有效，不占用或核销凭证 */
   inspect(token: string): { patId: number; expiresAtMs: number; remainingMs: number } | undefined {
     const entry = this.activeRecord(token);
     if (!entry) return undefined;
@@ -61,19 +61,19 @@ export class BindingTicketManager {
     };
   }
 
-  /** 撤销一个 PAT 尚未使用的全部短期连接链接。 */
+  /** 撤销一个 PAT 尚未使用的全部短期连接链接 */
   revokePat(patId: number): void {
     for (const [digest, record] of this.records) {
       if (record.patId === patId) this.records.delete(digest);
     }
   }
 
-  /** 判断该 PAT 是否正在提交连接，供解绑避免与登录并发。 */
+  /** 判断该 PAT 是否正在提交连接，供解绑避免与登录并发 */
   isPatActive(patId: number): boolean {
     return this.activePatIds.has(patId);
   }
 
-  /** 校验并独占凭证，绑定成功后撤销同一 PAT 的全部待用链接，失败时允许继续重试。 */
+  /** 校验并独占凭证，绑定成功后撤销同一 PAT 的全部待用链接，失败时允许继续重试 */
   async redeem<T>(request: Request, action: (patId: number) => Promise<T>): Promise<T> {
     const token = bearerToken(request);
     const entry = token ? this.activeRecord(token) : undefined;
@@ -98,7 +98,7 @@ export class BindingTicketManager {
     }
   }
 
-  /** 清除服务关闭前尚未使用的短期凭证。 */
+  /** 清除服务关闭前尚未使用的短期凭证 */
   close(): void {
     this.records.clear();
     this.activePatIds.clear();
@@ -124,7 +124,7 @@ export class BindingTicketManager {
   }
 }
 
-/** 验证请求中的 Bearer PAT，并返回数据库中的当前身份。 */
+/** 验证请求中的 Bearer PAT，并返回数据库中的当前身份 */
 export async function authenticatePat(
   request: Request,
   store: DataStore,
@@ -143,7 +143,7 @@ export async function authenticatePat(
   };
 }
 
-/** 只接受不含空白和逗号的单个 Bearer 凭证。 */
+/** 只接受不含空白和逗号的单个 Bearer 凭证 */
 function bearerToken(request: Request): string | undefined {
   return /^Bearer ([^\s,]+)$/i.exec(request.headers.get("authorization")?.trim() ?? "")?.[1];
 }
@@ -152,7 +152,7 @@ function ticketDigest(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-/** 要求 PAT 当前有效且已绑定一个钱迹账号。 */
+/** 要求 PAT 当前有效且已绑定一个钱迹账号 */
 export async function requireAccountPrincipal(
   principal: AuthenticatedPat,
   store: DataStore,
@@ -162,7 +162,7 @@ export async function requireAccountPrincipal(
   return { ...principal, accountId: current.accountId };
 }
 
-/** 要求请求中的 PAT 仍有效，允许调用不依赖账号绑定的工具。 */
+/** 要求请求中的 PAT 仍有效，允许调用不依赖账号绑定的工具 */
 export async function requirePatPrincipal(
   principal: AuthenticatedPat,
   store: DataStore,
@@ -174,7 +174,7 @@ export async function requirePatPrincipal(
   return current;
 }
 
-/** 要求使用由启动配置管理的超级管理员 PAT。 */
+/** 要求使用由启动配置管理的超级管理员 PAT */
 export function requireAdmin(principal: AuthenticatedPat): AuthenticatedPat {
   if (principal.role !== "admin") throw new AppError("MCP_FORBIDDEN", "需要超级管理员 PAT", 403);
   return principal;

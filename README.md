@@ -86,7 +86,7 @@ MCP Client 必须支持配置自定义 `Authorization` Header。
 
 - 需要按账本、资产、分类、标签或成员筛选，或者写入时缺少可信 ID，才调用对应查询工具获取，不得猜测或构造 ID
 - 使用 `list_bills` 批量盘点、查重或只读对账，需要完整筛选范围时继续翻页到 `nextCursor=null`，批量判断转账方向时直接读取摘要的 `fromId` 和 `targetId`，需要资产名称时只调用一次 `list_assets` 建立 ID 映射
-- 列表字段无歧义时不要逐条调用 `get_bill`，只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才读取单笔详情，写入成功后直接使用写入工具返回的完整账单
+- 列表字段无歧义时不要调用 `get_bills` 补充详情，只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才按 ID 一次批量读取完整记录，写入成功后直接使用写入工具返回的完整账单
 - 钱迹在其他设备发生变化后，调用 `refresh_cache` 获取最新数据
 - 创建、修改、退款、报销和删除操作会直接写入钱迹，请先确认参数
 
@@ -141,9 +141,10 @@ https://qianjiga.litangkj.com
 | 使用场景 | 工具 |
 |---|---|
 | 账号登录与解绑 | `connect_qianji`、`disconnect_qianji` |
+| 账号设置 | `set_user_timezone` |
 | 查询基础数据 | `list_books`、`list_book_members`、`list_assets`、`list_categories`、`list_tags`、`get_user_info` |
 | 查询借入或借出详情 | `list_debt_accounts` |
-| 查询、统计与刷新账单 | `list_bills`、`get_bill`、`get_bill_statistics`、`refresh_cache` |
+| 查询、统计与刷新账单 | `list_bills`、`get_bills`、`get_bill_statistics`、`refresh_cache` |
 | 查询预算使用情况 | `get_budget` |
 | 普通收支或待报销支出批量创建与修改 | `create_bills`、`update_bills` |
 | 删除普通收支、待报销支出、转账或还款 | `delete_bills` |
@@ -161,7 +162,7 @@ https://qianjiga.litangkj.com
 - `list_bills.remarkKeyword` 按不区分大小写的备注字面子串筛选
 - 请求下一页时只传上一页的 `nextCursor`，不要重复传筛选条件或 `limit`
 - `bookId: "-1"` 只表示钱迹默认账本，`categoryId` 不接受 `"-1"`
-- `create_bills`、`update_bills`和 `delete_bills` 即使只操作一笔也使用单项列表，级联删除在对应 `deletions[]` 项中显式设置 `cascadeRelatedBills: true`
+- `create_bills` 和 `update_bills` 即使只操作一笔也使用单项列表，`delete_bills` 传 `billIds`，删除会自动连带删除账单的退款和报销关联子账单
 - 批量写入只部分成功时，错误会按输入序号列出逐项结果，成功项已经写入，不得重试
 
 `money`、`fee` 和 `discount` 均使用币种主单位，不使用分、美分等最小货币单位。
@@ -172,8 +173,8 @@ https://qianjiga.litangkj.com
 | `USD 63` | 63 美元 |
 | `JPY 500` | 500 日元 |
 
-- 普通支出：`money` 对应 APP 主金额输入框，只支持 `discount`，实际扣款为 `money - discount`，收入不支持手续费或优惠
-- 转账或信用卡还款：`money` 对应 APP 主金额输入框，`fee` 和 `discount` 不能同时大于 0，手续费包含在 `money` 中，优惠从实际转出金额扣减
+- 普通支出：`money` 即用户输入的主金额，只支持 `discount`，实际扣款为 `money - discount`，收入不支持手续费或优惠
+- 转账或信用卡还款：`money` 即用户输入的主金额，`fee` 和 `discount` 不能同时大于 0，手续费包含在 `money` 中，优惠从实际转出金额扣减
 - 跨币种写入会使用账号已开启的多币种配置，`get_user_info.baseCurrency` 是当前本位币，账单 `currencyConversion` 是写入时的历史换算，不会按当前价格重算
 - 业务金额必须大于 0、不超过 `9,999,999,999.99` 且最多两位小数，手续费和优惠不能大于 `money`
 - 账号需要迁移新版报销时，首次 `reimburse_bills` 会明确提示迁移影响，向用户说明“迁移后旧版本将不能继续使用报销”并取得明确同意后，使用相同业务参数并将 `confirmReimbursementUpgrade` 设为 `true` 重试，服务器只会在钱迹明确要求时迁移并重试一次，不会为已升级账号主动迁移
@@ -196,7 +197,7 @@ https://qianjiga.litangkj.com
 | 有效 VIP | 8 个 | 不限 |
 | 非 VIP 或过期 VIP | 1 个 | 15 次 |
 
-每日额度按 `Asia/Shanghai` 自然日和钱迹 UID 计算，同一 UID 的多枚 PAT 共享额度，批量报销和关联删除分别按一次调用计数。
+每日额度按账号记账时区的自然日和钱迹 UID 计算，同一 UID 的多枚 PAT 共享额度，批量报销和关联删除分别按一次调用计数。
 
 ## 安全须知
 

@@ -8,6 +8,7 @@ import {
   hasReimbursement,
   inputBillMoney,
   inspectWriteResult,
+  MAX_BILL_CURSOR_LENGTH,
   MAX_MONEY,
   refundPatchApplied,
   refundRelationshipMap,
@@ -39,8 +40,8 @@ async function updateOneBill(
   return (await service.updateBills(accountId, [{ billId, patch }])).bills[0]!;
 }
 
-function deleteOneBill(service: MoneyTrackService, accountId: number, billId: string, cascadeRelatedBills = false) {
-  return service.deleteBills(accountId, [{ billId, cascadeRelatedBills }]);
+function deleteOneBill(service: MoneyTrackService, accountId: number, billId: string) {
+  return service.deleteBills(accountId, [billId]);
 }
 
 function bill(id: string, remark: string, time = 1_770_000_000): Record<string, unknown> {
@@ -577,6 +578,38 @@ test("账单统计的 month 始终使用 UTC+08:00 自然月", async (t) => {
   });
   assert.equal(statistics.average.unit, "day");
   assert.equal(statistics.average.periodCount, 28);
+});
+
+test("账号时区改为纽约后统计自然月按当地日历解释", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  // 北京 2026-05-01 09:00 对应纽约 2026-04-30 21:00，该账单按纽约口径属于 4 月
+  const now = Math.floor(Date.UTC(2026, 4, 1, 5) / 1000);
+  const time = Math.floor(Date.UTC(2026, 4, 1, 1) / 1000);
+  store.setUserCache(account.id, { id: account.uid, viptype: -1, vipstart: 0, vipend: 0, __baseCurrency: "CNY" }, now * 1000);
+  store.setCatalogCache(account.id, "books", "", [{ bookid: "1", name: "账本", visible: 1 }], now * 1000);
+  store.setCatalogCache(account.id, "categories", "1", [{ id: "2", name: "支出", type: 0 }], now * 1000);
+  store.setSyncState(accountId, { cursor: 1 });
+  store.applySyncBatch(accountId, {
+    changes: [bill("1770000000000000097", "纽约四月账单", time)],
+    deletes: [],
+    invalidatedCategoryScopes: [],
+    lasttimes: [],
+  });
+  store.setAccountTimeZone(accountId, "America/New_York");
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: async () => { throw new Error("unexpected request"); } }), () => now * 1000);
+
+  const april = await service.getBillStatistics(accountId, {
+    bookId: "1",
+    range: { kind: "month", year: 2026, month: 4 },
+  }) as { counts: { matchedBillCount: number }; range: { startTime: number; endTime: number; timezoneOffsetSeconds: number } };
+  assert.equal(april.counts.matchedBillCount, 1);
+  assert.equal(april.range.timezoneOffsetSeconds, -14_400); // now 在 5 月，纽约夏令时偏移为 -04:00
+  const may = await service.getBillStatistics(accountId, {
+    bookId: "1",
+    range: { kind: "month", year: 2026, month: 5 },
+  }) as { counts: { matchedBillCount: number } };
+  assert.equal(may.counts.matchedBillCount, 0);
 });
 
 test("预算查询按自定义月和 APK 金额规则聚合总预算、分类预算及日统计", async (t) => {
@@ -1246,6 +1279,13 @@ test("同步分页固定初始 lasttimes，并原子 upsert changes/delete delet
   assert.equal(store.getBill(account.id, "1770000000000000001"), undefined);
   assert.equal(store.getBill(account.id, "1770000000000000003")?.remark, "page-two");
   assert.equal(store.getBill(account.id, "1770000000000000004")?.type, 2);
+  assert.deepEqual(
+    store.getBills(account.id, ["1770000000000000004", "1770000000000000001", "1770000000000000003"])
+      .map((row) => row.remark)
+      .sort(),
+    ["page-two", "transfer"],
+  );
+  assert.deepEqual(store.getBills(account.id, []), []);
   assert.deepEqual(store.getSyncState(account.id), { cursor: 9 });
 });
 
@@ -1291,9 +1331,7 @@ test("首次同步后查询只读本地，并完整缓存复杂类型与退款�
   assert.equal(transfer.categoryId, null);
   assert.equal(JSON.parse(store.getBill(account.id, String(transfer.id))!.rawJson).opaque_field, "preserve-me");
 
-  const source = await service.getBill(accountId, sourceId);
-  const refund = await service.getBill(accountId, refundId);
-  const reimbursement = await service.getBill(accountId, reimbursementId);
+  const [source, refund, reimbursement] = await service.getBills(accountId, [sourceId, refundId, reimbursementId]);
   assert.deepEqual(source.refundBillIds, [refundId]);
   assert.deepEqual(source.reimbursementBillIds, [reimbursementId]);
   assert.deepEqual(source.refundProgress, { totalAmount: 3, remainingAmount: 7 });
@@ -1404,7 +1442,7 @@ test("显式刷新分页失败时继续提供刷新前的账单与游标", async
   );
   assert.equal(store.getBill(account.id, id)?.remark, "stable-cache");
   assert.deepEqual(store.getSyncState(account.id), { cursor: 7 });
-  assert.equal((await service.getBill(accountId, id)).remark, "stable-cache");
+  assert.equal((await service.getBills(accountId, [id]))[0]!.remark, "stable-cache");
   assert.equal(pullCalls, 2);
 });
 
@@ -1490,7 +1528,7 @@ test("指定账本在同步前确认属于当前账号", async (t) => {
   assert.equal(syncCalled, false);
 });
 
-test("初始化完成后 list_bills 和 get_bill 只读本地缓存", async (t) => {
+test("初始化完成后 list_bills 和 get_bills 只读本地缓存", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   store.setSyncState(account.id, { cursor: 7 });
@@ -1508,10 +1546,11 @@ test("初始化完成后 list_bills 和 get_bill 只读本地缓存", async (t) 
   const service = new MoneyTrackService(store, client);
 
   const result = await service.listBills(accountId, { bookId: "1" });
-  const complete = await service.getBill(accountId, String(localBill.id));
+  const complete = await service.getBills(accountId, [String(localBill.id)]);
 
   assert.equal(result.bills.length, 1);
-  assert.equal(complete.remark, "local-cache");
+  assert.equal(complete[0]!.remark, "local-cache");
+  assert.equal((await service.getBills(accountId, ["1770000000000000100"])).length, 0);
   assert.equal(requests.length, 0);
   assert.deepEqual(store.getSyncState(account.id), { cursor: 7 });
 });
@@ -1668,6 +1707,38 @@ test("list_bills 高级筛选按公开金额排序，且游标拒绝篡改", asy
   const tampered = `c3_${Buffer.from(JSON.stringify(decoded)).toString("hex")}`;
   await assert.rejects(
     service.listBills(accountId, { cursor: tampered }),
+    (error) => error instanceof AppError && error.code === "INVALID_CURSOR",
+  );
+});
+
+test("list_bills 游标在上界输入下保持翻页并拒绝超长标签 ID 元素", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = 1_770_000_000_000;
+  const upstream = createBusinessUpstream();
+  upstream.seed({ ...bill("1770000000000100201", "较早一笔", 1_770_000_001), money: 10, extra: { tags: ["tag-1"] } });
+  upstream.seed({ ...bill("1770000000000100202", "较晚一笔", 1_770_000_002), money: 20, extra: { tags: ["tag-1"] } });
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: upstream.fetch }), () => now);
+
+  const tagIds = ["tag-1", ...Array.from({ length: 99 }, (_, index) => `${index}`.padStart(64, "a"))];
+  const first = await service.listBills(accountId, { bookId: "1", tagIds, limit: 1 });
+  assert.equal(first.bills[0]?.id, "1770000000000100202");
+  assert.equal(typeof first.nextCursor, "string");
+  assert.ok(first.nextCursor!.length <= MAX_BILL_CURSOR_LENGTH);
+  const second = await service.listBills(accountId, { cursor: first.nextCursor! });
+  assert.equal(second.bills[0]?.id, "1770000000000100201");
+  assert.equal(second.nextCursor, null);
+
+  const oversized = `c3_${Buffer.from(JSON.stringify({
+    v: 3,
+    accountId,
+    offset: 1,
+    filters: { tagIds: ["x".repeat(65)] },
+    limit: 20,
+  })).toString("hex")}`;
+  await assert.rejects(
+    service.listBills(accountId, { cursor: oversized }),
     (error) => error instanceof AppError && error.code === "INVALID_CURSOR",
   );
 });
@@ -2087,7 +2158,7 @@ test("fixture 完成创建、完整对象更新和删除闭环", async (t) => {
   assert.equal("flag" in (listed.bills[0] ?? {}), false);
   assert.equal(listed.bills[0]?.money, 25.8);
   assert.equal(listed.bills[0]?.discount, 3);
-  const detailedAfterCreate = await service.getBill(accountId, id);
+  const detailedAfterCreate = (await service.getBills(accountId, [id]))[0]!;
   assert.equal(detailedAfterCreate.money, 25.8);
   assert.equal(detailedAfterCreate.discount, 3);
   assert.equal("createtime" in created, false);
@@ -2140,7 +2211,7 @@ test("fixture 完成创建、完整对象更新和删除闭环", async (t) => {
   assert.equal(sent.userid, "uid-1");
   assert.equal(sent.createtime, created.createTime);
   const listedAfterUpdate = await service.listBills(accountId, { bookId: "1" });
-  const detailedAfterUpdate = await service.getBill(accountId, id);
+  const detailedAfterUpdate = (await service.getBills(accountId, [id]))[0]!;
   assert.equal(listedAfterUpdate.bills[0]?.money, 25.7);
   assert.equal(listedAfterUpdate.bills[0]?.discount, 2);
   assert.equal(detailedAfterUpdate.money, 25.7);
@@ -2150,9 +2221,7 @@ test("fixture 完成创建、完整对象更新和删除闭环", async (t) => {
   assert.equal(((await service.listAssets(accountId, false, true))[0]!.children as Record<string, unknown>[])[0]!.money, 76.3);
   assert.equal(assetListCalls, assetListCallsAfterUpdate);
 
-  assert.deepEqual(await deleteOneBill(service, accountId, id), {
-    deleted: [{ billId: id, relatedBillIds: [] }],
-  });
+  assert.deepEqual(await deleteOneBill(service, accountId, id), { deleted: true });
   const deletePayload = upstream.payloads[2] as { bills: { dellist: string[] } };
   assert.equal(JSON.stringify(deletePayload.bills.dellist), `[${id}]`);
 });
@@ -2210,9 +2279,7 @@ test("收入 type=1 通过 fixture 完成创建、修改和删除", async (t) =>
   const updated = await updateOneBill(service, accountId, String(created.id), { money: 120 });
   assert.equal(updated.money, 120);
   assert.equal(((await service.listAssets(accountId, false, true))[0]!.children as Record<string, unknown>[])[0]!.money, 220);
-  assert.deepEqual(await deleteOneBill(service, accountId, String(created.id)), {
-    deleted: [{ billId: String(created.id), relatedBillIds: [] }],
-  });
+  assert.deepEqual(await deleteOneBill(service, accountId, String(created.id)), { deleted: true });
   assert.equal(store.getCatalogCache(accountId, "assets"), undefined);
 });
 
@@ -2370,8 +2437,8 @@ test("普通账单批量先全量校验，每个阶段只发一次同步请求",
   assert.deepEqual(updated.bills.map(({ remark }) => remark), ["更新1", "更新2", "更新3", "更新4"]);
   assert.equal(((upstream.syncPayloads[1]?.bills as { changelist: unknown[] }).changelist).length, 4);
 
-  const deleted = await service.deleteBills(accountId, created.bills.map(({ id }) => ({ billId: String(id) })));
-  assert.equal(deleted.deleted.length, 4);
+  const deleted = await service.deleteBills(accountId, created.bills.map(({ id }) => String(id)));
+  assert.deepEqual(deleted, { deleted: true });
   assert.equal(((upstream.syncPayloads[2]?.bills as { dellist: unknown[] }).dellist).length, 4);
 });
 
@@ -2857,12 +2924,12 @@ test("账单所有者、旧关系和已报销字段锁在共享入口生效", as
     service.createRefund(accountId, { sourceBillId: noCategoryId, money: 1 }),
     (error) => error instanceof AppError && error.code === "REFUND_SOURCE_CATEGORY_MISSING",
   );
-  assert.deepEqual(await deleteOneBill(service, accountId, refundedId, true), {
-    deleted: [{ billId: refundedId, relatedBillIds: [refundChildId] }],
-  });
+  assert.deepEqual(await deleteOneBill(service, accountId, refundedId), { deleted: true });
+  const legacyDelete = upstream.syncPayloads[upstream.syncPayloads.length - 1] as { bills: { dellist: unknown[] } };
+  assert.deepEqual(legacyDelete.bills.dellist.map((item) => JSON.stringify(item)).sort(), [refundedId, refundChildId].sort());
 });
 
-test("退款整组落库并支持修改、单独删除和显式关联删除", async (t) => {
+test("退款整组落库并支持修改、单独删除和级联删除", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = 1_770_000_000_000;
@@ -2899,7 +2966,7 @@ test("退款整组落库并支持修改、单独删除和显式关联删除", as
   assert.equal(refund.time, Math.floor(now / 1000) + 1);
   assert.equal(refund.refundSourceBillId, sourceId);
   assert.equal(refund.assetId, "3");
-  assert.deepEqual((await service.getBill(accountId, sourceId)).refundBillIds, [refundId]);
+  assert.deepEqual((await service.getBills(accountId, [sourceId]))[0]!.refundBillIds, [refundId]);
   assert.equal(store.getCatalogCache(account.id, "assets"), undefined);
 
   const updated = await service.updateRefund(accountId, refundId, { money: 4, remark: "改为四元" });
@@ -2907,19 +2974,20 @@ test("退款整组落库并支持修改、单独删除和显式关联删除", as
   const overage = await service.createRefund(accountId, { sourceBillId: sourceId, money: 7, assetId: null });
   assert.equal(overage.money, 7);
   assert.equal(overage.assetId, null);
-  await assert.rejects(
-    deleteOneBill(service, accountId, sourceId),
-    (error) => error instanceof AppError && error.code === "RELATED_BILLS_EXIST",
-  );
 
-  assert.deepEqual(await service.deleteRefund(accountId, refundId), { deleted: true, refundBillId: refundId });
-  assert.deepEqual(await service.deleteRefund(accountId, String(overage.id)), { deleted: true, refundBillId: String(overage.id) });
-  assert.deepEqual((await service.getBill(accountId, sourceId)).refundBillIds, undefined);
+  assert.deepEqual(await service.deleteRefund(accountId, refundId), { deleted: true });
+  assert.deepEqual(await service.deleteRefund(accountId, String(overage.id)), { deleted: true });
+  assert.deepEqual((await service.getBills(accountId, [sourceId]))[0]!.refundBillIds, undefined);
 
   const related = await service.createRefund(accountId, { sourceBillId: sourceId, money: 2 });
-  assert.deepEqual(await deleteOneBill(service, accountId, sourceId, true), {
-    deleted: [{ billId: sourceId, relatedBillIds: [String(related.id)] }],
-  });
+  await assert.rejects(
+    service.deleteBills(accountId, [sourceId, sourceId]),
+    (error) => error instanceof AppError && error.code === "INVALID_BILL_IDS",
+  );
+  assert.deepEqual(await deleteOneBill(service, accountId, sourceId), { deleted: true });
+  const deletePayload = upstream.syncPayloads[upstream.syncPayloads.length - 1] as { bills: { dellist: unknown[] } };
+  const deletedIds = deletePayload.bills.dellist.map((item) => JSON.stringify(item)).sort();
+  assert.deepEqual(deletedIds, [sourceId, String(related.id)].sort());
   assert.equal(store.getCatalogCache(account.id, "assets"), undefined);
 });
 
@@ -3110,7 +3178,7 @@ test("批量报销一次计额、保存全部账单、失效资产缓存并用�
   });
   assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-12", used: 1 });
   assert.equal(store.getCatalogCache(account.id, "assets"), undefined);
-  assert.equal((await service.getBill(accountId, sourceA)).reimbursementBillIds instanceof Array, true);
+  assert.equal((await service.getBills(accountId, [sourceA]))[0]!.reimbursementBillIds instanceof Array, true);
   const overage = await service.reimburseBills(accountId, {
     sourceBillIds: [sourceA],
     money: 10,
@@ -3124,19 +3192,19 @@ test("批量报销一次计额、保存全部账单、失效资产缓存并用�
     baseCurrency: "CNY",
     baseAmount: 70,
   });
-  assert.deepEqual(await service.deleteReimbursement(accountId, String(overageChild.id)), {
-    deleted: true,
-    reimbursementBillId: String(overageChild.id),
-  });
-  assert.equal(((await service.getBill(accountId, sourceA)).reimbursementBillIds as string[]).length, 1);
+  assert.deepEqual(await service.deleteReimbursement(accountId, String(overageChild.id)), { deleted: true });
+  assert.equal(((await service.getBills(accountId, [sourceA]))[0]!.reimbursementBillIds as string[]).length, 1);
 
-  assert.deepEqual(await service.cancelReimbursements(accountId, [sourceA, sourceB]), {
-    cancelled: true,
-    sourceBillIds: [sourceA, sourceB],
-  });
+  assert.deepEqual(await service.cancelReimbursements(accountId, [sourceA, sourceB]), { cancelled: true });
   assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-12", used: 4 });
-  assert.equal((await service.getBill(accountId, sourceA)).reimbursementBillIds, undefined);
+  assert.equal((await service.getBills(accountId, [sourceA]))[0]!.reimbursementBillIds, undefined);
   assert.deepEqual(upstream.cancelledSourceIds, [sourceA, sourceB]);
+
+  const cascade = await service.reimburseBills(accountId, { sourceBillIds: [sourceA], money: 5, assetId: "3" });
+  const cascadeChild = String(cascade.bills.find(({ type }) => type === 21)!.id);
+  assert.deepEqual(await service.deleteBills(accountId, [sourceA]), { deleted: true });
+  const cascadeDelete = upstream.syncPayloads[upstream.syncPayloads.length - 1] as { bills: { dellist: unknown[] } };
+  assert.deepEqual(cascadeDelete.bills.dellist.map((item) => JSON.stringify(item)).sort(), [sourceA, cascadeChild].sort());
 });
 
 test("新版报销迁移必须明确同意，并在迁移后重新校验且只重试一次", async (t) => {

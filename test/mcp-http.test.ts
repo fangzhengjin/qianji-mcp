@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { runInNewContext } from "node:vm";
+import { formatIsoTime } from "../src/time.ts";
 
 import { Client, StreamableHTTPClientTransport, UrlElicitationRequiredError } from "@modelcontextprotocol/client";
 
@@ -25,8 +26,8 @@ const BUSINESS_TOOLS = [
   "delete_reimbursement",
   "delete_refund",
   "disconnect_qianji",
-  "get_bill",
   "get_bill_statistics",
+  "get_bills",
   "get_budget",
   "get_user_info",
   "list_assets",
@@ -37,6 +38,7 @@ const BUSINESS_TOOLS = [
   "list_debt_accounts",
   "list_tags",
   "refresh_cache",
+  "set_user_timezone",
   "reimburse_bills",
   "update_bills",
   "update_refund",
@@ -207,7 +209,7 @@ function assertUnitDescriptions(schema: unknown, path: string): void {
       if (name === "money" || name === "fee" || name === "discount") {
         assert.match(description, /币种主单位.*不使用.*最小货币单位.*CNY.*USD.*JPY/, `${path}.${name} must state the currency unit`);
       } else if (["time", "startTime", "endTime", "createTime", "createStartTime", "createEndTime", "updateTime", "registeredAt", "vipStart", "vipEnd", "expiresAt", "createdAt", "dailyWriteResetsAt"].includes(name)) {
-        assert.match(description, /Unix 秒/, `${path}.${name} must state the time unit`);
+        assert.match(description, /ISO 8601/, `${path}.${name} must state the time format`);
       } else if (name === "memberCount") {
         assert.match(description, /单位为人/, `${path}.${name} must state the count unit`);
       } else if (["dailyWriteLimit", "dailyWriteUsed", "dailyWriteRemaining"].includes(name)) {
@@ -307,16 +309,16 @@ test("服务器级说明同时通过新版 discover 和旧版 initialize 返回"
   assert.match(serverInstructions, /账本.*list_books.*nameKeyword/);
   assert.match(serverInstructions, /预算使用情况.*get_budget.*月份起始日.*includeDailyStatistics=true/);
   assert.match(serverInstructions, /批量判断转账方向.*list_bills.*fromId.*targetId.*一次.*list_assets/s);
-  assert.match(serverInstructions, /列表字段无歧义.*不要逐条调用.*get_bill.*重复或近似候选.*关系冲突.*摘要缺失字段.*完整记录.*写入成功后.*完整账单/s);
+  assert.match(serverInstructions, /列表字段无歧义.*不要调用.*get_bills.*补充详情.*重复或近似候选.*关系冲突.*摘要缺失字段.*完整记录.*一次批量读取.*写入成功后.*完整账单/s);
   assert.doesNotMatch(serverInstructions, /写入后验证/);
   assert.match(serverInstructions, /update_transfer.*同一次修改.*最终场景、金额和双边资产/s);
   assert.match(serverInstructions, /refresh_cache.*全部目录缓存.*币种目录/s);
-  assert.match(serverInstructions, /旧版本将不能继续使用报销.*明确同意.*confirmReimbursementUpgrade.*不得预先同意.*只在钱迹明确要求时迁移并只重试一次/s);
+  assert.match(serverInstructions, /收到迁移新版报销提示时.*旧版本将不能继续使用报销.*明确同意.*confirmReimbursementUpgrade.*不得预先同意，仅可重试一次/s);
   assert.match(serverInstructions, /迁移完成但报销失败.*不得再次迁移/s);
   assert.match(serverInstructions, /删除或取消.*取得用户确认/s);
   assert.match(serverInstructions, /普通收支、待报销支出、转账或还款.*delete_bills/s);
   assert.match(serverInstructions, /取消一笔或多笔源账单的全部报销关系.*cancel_reimbursements.*保留源账单/s);
-  assert.match(serverInstructions, /WRITE_PARTIAL.*输入序号.*成功项已经写入.*不得重试/s);
+  assert.match(serverInstructions, /WRITE_PARTIAL.*只处理错误中标记为冲突或未确认的项.*不得重试成功项/s);
   assert.match(serverInstructions, /汇率.*HALF_UP.*10 位.*换算金额.*HALF_EVEN.*2 位/s);
   const clients = [
     new Client(
@@ -399,8 +401,8 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     assert.equal("flag" in (patch.properties as Record<string, unknown>), false);
   }
   assert.equal(schemaNode(tools.find(({ name }) => name === "create_transfer")?.inputSchema, "creditRepayment").default, false);
-  const billOutput = schemaNode(tools.find(({ name }) => name === "get_bill")?.outputSchema, "bill");
-  assert.match(String(schemaNode(billOutput, "money").description), /普通支出、转账或信用卡还款.*APP 主金额输入框/);
+  const billOutput = schemaNode(tools.find(({ name }) => name === "get_bills")?.outputSchema, "items");
+  assert.match(String(schemaNode(billOutput, "money").description), /普通支出、转账或信用卡还款.*用户输入的主金额/);
   assert.match(String(schemaNode(billOutput, "fee").description), /转账或信用卡还款.*包含在 money/);
   assert.match(String(schemaNode(billOutput, "discount").description), /普通支出、转账或信用卡还款.*money - discount/);
   assert.equal(schemaNode(billOutput, "excludeFromIncomeExpense").type, "boolean");
@@ -412,7 +414,11 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     assert.deepEqual(tools.find((tool) => tool.name === name)?.inputSchema.required, []);
   }
   for (const tool of tools.filter(({ name }) => name.startsWith("list_"))) {
-    assert.equal("results" in (tool.outputSchema!.properties as Record<string, unknown>), true, `${tool.name} must return results`);
+    if (tool.name === "list_bills") {
+      assert.equal("results" in (tool.outputSchema!.properties as Record<string, unknown>), true, "list_bills must keep results for nextCursor");
+    } else {
+      assert.equal(tool.outputSchema!.type, "array", `${tool.name} must return a top-level array`);
+    }
   }
   for (const tool of tools) {
     assert.doesNotMatch(tool.description ?? "", /仅当用户|调用前|重试|nextCursor|不要逐条|type\s*-?\d|reimbursable=|cascadeRelatedBills/);
@@ -436,9 +442,11 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.equal(schemaNode(tools.find(({ name }) => name === "list_bills")?.inputSchema, "remarkKeyword").maxLength, 42);
   assert.match(String(schemaNode(tools.find(({ name }) => name === "list_bills")?.inputSchema, "remarkKeyword").description), /匹配账单备注.*不区分大小写.*字面子串/);
   const listBillsTool = tools.find(({ name }) => name === "list_bills")!;
-  const getBillTool = tools.find(({ name }) => name === "get_bill")!;
+  const getBillTool = tools.find(({ name }) => name === "get_bills")!;
   assert.equal(listBillsTool.description, "分页查询当前钱迹账号的账单摘要");
-  assert.equal(getBillTool.description, "按账单 ID 返回完整账单详情");
+  assert.equal(getBillTool.description, "按账单 ID 列表批量返回完整账单，只返回存在的账单，缺失的 ID 不会出现在结果中，调用方需自行比对请求与返回的 ID，重复 ID 去重");
+  assert.equal(schemaNode(getBillTool.inputSchema, "billIds").minItems, 1);
+  assert.equal(schemaNode(getBillTool.inputSchema, "billIds").maxItems, 100);
   for (const [toolName, path] of [
     ["create_bills", ["bills", "items", "tagIds"]],
     ["update_bills", ["updates", "items", "patch", "tagIds"]],
@@ -451,12 +459,12 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     const field = schemaNode(tools.find(({ name }) => name === toolName)?.inputSchema, ...path);
     assert.equal(field.maxItems, 8);
     assert.equal(field.uniqueItems, true);
-    assert.equal((field.items as Record<string, unknown>).maxLength, undefined);
+    assert.equal((field.items as Record<string, unknown>).maxLength, 64);
     assert.doesNotMatch(String(field.description), /8|VIP|get_user_info|最多/);
   }
   assert.equal(schemaNode(listBillsTool.inputSchema, "tagIds").maxItems, 100);
-  assert.equal((schemaNode(listBillsTool.inputSchema, "tagIds").items as Record<string, unknown>).maxLength, undefined);
-  assert.equal((schemaNode(listBillsTool.inputSchema, "memberIds").items as Record<string, unknown>).maxLength, undefined);
+  assert.equal((schemaNode(listBillsTool.inputSchema, "tagIds").items as Record<string, unknown>).maxLength, 64);
+  assert.equal((schemaNode(listBillsTool.inputSchema, "memberIds").items as Record<string, unknown>).maxLength, 64);
   assert.equal(schemaNode(listBillsTool.inputSchema, "currency").pattern, undefined);
   assert.equal(schemaNode(listBillsTool.inputSchema, "currency").minLength, 1);
   const createBills = tools.find(({ name }) => name === "create_bills")!;
@@ -500,7 +508,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   ] as const) {
     assert.match(
       String(schemaNode(tools.find(({ name }) => name === toolName)?.inputSchema, ...path).description),
-      /APP 主金额输入框.*普通支出实际扣款为 money - discount/,
+      /主金额口径.*普通支出实际扣款为 money - discount/,
     );
   }
   const categoryType = schemaNode(tools.find(({ name }) => name === "list_categories")?.inputSchema, "type");
@@ -533,9 +541,9 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   for (const branch of billType.anyOf as Array<{ const: number; description: string }>) {
     assert.equal(branch.description.startsWith(`${branch.const}`), false);
   }
-  const bookItem = schemaNode(tools.find(({ name }) => name === "list_books")?.outputSchema, "results", "items");
+  const bookItem = schemaNode(tools.find(({ name }) => name === "list_books")?.outputSchema, "items");
   assert.equal(String(schemaNode(bookItem, "type").description), "钱迹动态下发的账本模板类型代码");
-  const assetItem = schemaNode(tools.find(({ name }) => name === "list_assets")?.outputSchema, "results", "items", "children", "items");
+  const assetItem = schemaNode(tools.find(({ name }) => name === "list_assets")?.outputSchema, "items", "children", "items");
   assert.equal((assetItem.required as string[]).includes("money"), false);
   assert.equal(schemaNode(assetItem, "currency").pattern, undefined);
   assert.equal(schemaNode(assetItem, "currency").minLength, 1);
@@ -557,40 +565,40 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.match(String(schemaNode(billSummary, "targetId").description), /目标关联资产 ID.*上游未返回.*省略/);
   assert.equal(tools.find(({ name }) => name === "create_bills")?.description, "批量创建普通支出、收入或待报销支出账单");
   assert.equal(tools.find(({ name }) => name === "update_bills")?.description, "批量修改普通支出、收入或待报销支出账单");
-  assert.equal(tools.find(({ name }) => name === "delete_bills")?.description, "批量永久删除普通收支、待报销支出、转账或信用卡还款账单");
+  assert.equal(tools.find(({ name }) => name === "delete_bills")?.description, "批量永久删除普通收支、待报销支出、转账或信用卡还款账单，并自动连带删除其退款和报销关联子账单");
   assert.equal(tools.find(({ name }) => name === "list_debt_accounts")?.description, "独立查询当前钱迹账号的借入或借出详情");
-  const debtItem = schemaNode(tools.find(({ name }) => name === "list_debt_accounts")?.outputSchema, "results", "items");
+  const debtItem = schemaNode(tools.find(({ name }) => name === "list_debt_accounts")?.outputSchema, "items");
   assert.equal((debtItem.required as string[]).includes("finishedAt"), false);
   assert.equal(schemaNode(debtItem, "principal").minimum, 0);
   assert.equal(schemaNode(debtItem, "balance").minimum, 0);
   assert.equal(schemaNode(debtItem, "totalPaid").minimum, 0);
   assert.match(String(schemaNode(debtItem, "endDate").description), /计划还款或收款日期.*status.*无直接关系/);
-  assert.match(String(schemaNode(debtItem, "finishedAt").description), /实际结束时间.*Unix 秒.*仅 status=ended/);
+  assert.match(String(schemaNode(debtItem, "finishedAt").description), /实际结束时间.*ISO 8601.*仅 status=ended/);
   const statisticsTool = tools.find(({ name }) => name === "get_bill_statistics")!;
   assert.equal(
     statisticsTool.description,
-    "聚合本地账单并返回固定统计结果，金额统计采用钱迹 APK 已确认的主报表规则，日均分母只计已经完整结束的日历日",
+    "聚合本地账单并返回固定统计结果，金额统计采用钱迹主报表规则，日均分母只计已经完整结束的日历日",
   );
   assert.match(
-    String(schemaNode(statisticsTool.outputSchema, "statistics", "average", "periodCount").description),
-    /unit=day.*完整结束的日历日.*不超过 365 天.*自定义范围.*startTime.*endTime 后一秒.*自然日零点.*86400 秒.*无账单.*当天不计入.*有账单.*0.*unit=month\/year.*有账单期间.*超过 365 天.*year/,
+    String(schemaNode(statisticsTool.outputSchema, "average", "periodCount").description),
+    /unit=day.*已完整结束的日历日.*无账单的期间也计入.*unit=month\/year.*有账单的期间.*跨度超过 365 天的自定义范围使用 year/,
   );
-  const statisticsSummary = schemaNode(statisticsTool.outputSchema, "statistics", "summary");
+  const statisticsSummary = schemaNode(statisticsTool.outputSchema, "summary");
   assert.match(String(schemaNode(statisticsSummary, "pureIncome").description), /收入.*借出利息收入.*关联退款.*正数部分/);
   assert.match(String(schemaNode(statisticsSummary, "pureSpend").description), /支出.*借入利息支出.*关联退款.*正数部分/);
   assert.match(String(schemaNode(statisticsSummary, "reimbursementIncome").description), /已报销金额.*报销基数.*总收入/);
   assert.match(String(schemaNode(statisticsSummary, "refundSpend").description), /收入.*借出利息收入.*关联退款.*源金额.*总支出/);
-  assert.match(String(schemaNode(statisticsTool.outputSchema, "statistics", "categoryBreakdown", "spend").description), /支出.*借入利息支出.*待报销支出.*不含手续费和退款支出/);
-  assert.match(String(schemaNode(statisticsTool.outputSchema, "statistics", "categoryBreakdown").description), /totalSpend.*totalIncome.*比例合计小于 100%/);
+  assert.match(String(schemaNode(statisticsTool.outputSchema, "categoryBreakdown", "spend").description), /支出.*借入利息支出.*待报销支出.*不含手续费和退款支出/);
+  assert.match(String(schemaNode(statisticsTool.outputSchema, "categoryBreakdown").description), /totalSpend.*totalIncome.*比例合计小于 100%/);
   const budgetTool = tools.find(({ name }) => name === "get_budget")!;
   assert.equal(budgetTool.description, "查询账本指定月份或年份的预算使用情况");
   assert.equal(schemaNode(budgetTool.inputSchema, "includeDailyStatistics").default, false);
   assert.match(String(schemaNode(budgetTool.inputSchema, "period").description), /省略.*账本月份起始日.*当前月/);
-  const budgetOutput = schemaNode(budgetTool.outputSchema, "budget");
+  const budgetOutput = budgetTool.outputSchema as Record<string, unknown>;
   assert.match(String(schemaNode(budgetOutput, "configured").description), /false.*summary.*null.*categories.*空数组/);
   assert.match(String(schemaNode(budgetOutput, "categories", "items", "billCount").description), /零消耗.*不计预算.*仍计入/);
   assert.match(String(schemaNode(budgetOutput, "dailyStatistics").description), /includeDailyStatistics=true.*每个日历日/);
-  const userSchema = schemaNode(tools.find(({ name }) => name === "get_user_info")?.outputSchema, "user");
+  const userSchema = tools.find(({ name }) => name === "get_user_info")?.outputSchema as Record<string, unknown>;
   const userBranches = userSchema.oneOf as Record<string, unknown>[];
   assert.equal(userBranches.length, 2);
   const vipBranch = userBranches.find((branch) => schemaNode(branch, "isVip").const === true)!;
@@ -601,7 +609,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.deepEqual(schemaNode(vipBranch, "registrationMethod").enum, ["手机号", "微博", "QQ", "邮箱", "微信", "Apple ID", "华为账号"]);
   assert.equal(schemaNode(vipBranch, "registrationMethod").anyOf, undefined);
   assert.deepEqual(nonVipBranch.required, [
-    "id", "name", "avatar", "registeredAt", "vipType", "vipStart", "vipEnd", "baseCurrency", "isVip",
+    "id", "name", "avatar", "registeredAt", "vipType", "vipStart", "vipEnd", "baseCurrency", "timeZone", "isVip",
     "dailyWriteLimit", "dailyWriteUsed", "dailyWriteRemaining", "dailyWriteResetsAt",
   ]);
   assert.deepEqual(
@@ -613,7 +621,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   }
   const reimbursementTool = tools.find(({ name }) => name === "reimburse_bills")!;
   assert.deepEqual(reimbursementTool.inputSchema.required, ["sourceBillIds", "money"]);
-  assert.match(String(schemaNode(reimbursementTool.inputSchema, "sourceBillIds").description), /内部.*APK.*分摊/);
+  assert.match(String(schemaNode(reimbursementTool.inputSchema, "sourceBillIds").description), /内部.*钱迹.*分摊/);
   for (const [toolName, path] of [
     ["create_bills", ["bills", "items", "currencyConversion"]],
     ["update_bills", ["updates", "items", "patch", "currencyConversion"]],
@@ -642,7 +650,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     ["list_bills", "inputSchema", ["assetId"]],
     ["list_bills", "inputSchema", ["fromAssetId"]],
     ["list_bills", "inputSchema", ["targetAssetId"]],
-    ["get_bill", "inputSchema", ["billId"]],
+    ["get_bills", "inputSchema", ["billIds", "items"]],
     ["create_bills", "inputSchema", ["bills", "items", "bookId"]],
     ["create_bills", "inputSchema", ["bills", "items", "categoryId"]],
     ["create_bills", "inputSchema", ["bills", "items", "tagIds", "items"]],
@@ -650,7 +658,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     ["update_bills", "inputSchema", ["updates", "items", "patch", "bookId"]],
     ["update_bills", "inputSchema", ["updates", "items", "patch", "categoryId"]],
     ["update_bills", "inputSchema", ["updates", "items", "patch", "tagIds", "items"]],
-    ["delete_bills", "inputSchema", ["deletions", "items", "billId"]],
+    ["delete_bills", "inputSchema", ["billIds", "items"]],
     ["create_transfer", "inputSchema", ["bookId"]],
     ["create_transfer", "inputSchema", ["fromAssetId"]],
     ["create_transfer", "inputSchema", ["targetAssetId"]],
@@ -664,37 +672,36 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     ["delete_reimbursement", "inputSchema", ["reimbursementBillId"]],
     ["cancel_reimbursements", "inputSchema", ["sourceBillIds", "items"]],
     ["list_book_members", "inputSchema", ["bookId"]],
-    ["list_book_members", "outputSchema", ["results", "items", "userId"]],
-    ["list_books", "outputSchema", ["results", "items", "bookId"]],
-    ["list_assets", "outputSchema", ["results", "items", "name"]],
-    ["list_assets", "outputSchema", ["results", "items", "children", "items", "id"]],
-    ["list_categories", "outputSchema", ["results", "items", "id"]],
-    ["list_categories", "outputSchema", ["results", "items", "parentId"]],
-    ["list_categories", "outputSchema", ["results", "items", "children", "items", "id"]],
-    ["list_categories", "outputSchema", ["results", "items", "children", "items", "parentId"]],
-    ["list_tags", "outputSchema", ["results", "items", "groupId"]],
-    ["list_tags", "outputSchema", ["results", "items", "children", "items", "id"]],
+    ["list_book_members", "outputSchema", ["items", "userId"]],
+    ["list_books", "outputSchema", ["items", "bookId"]],
+    ["list_assets", "outputSchema", ["items", "name"]],
+    ["list_assets", "outputSchema", ["items", "children", "items", "id"]],
+    ["list_categories", "outputSchema", ["items", "id"]],
+    ["list_categories", "outputSchema", ["items", "parentId"]],
+    ["list_categories", "outputSchema", ["items", "children", "items", "id"]],
+    ["list_categories", "outputSchema", ["items", "children", "items", "parentId"]],
+    ["list_tags", "outputSchema", ["items", "groupId"]],
+    ["list_tags", "outputSchema", ["items", "children", "items", "id"]],
     ["list_bills", "outputSchema", ["results", "items", "id"]],
     ["list_bills", "outputSchema", ["results", "items", "bookId"]],
     ["list_bills", "outputSchema", ["results", "items", "fromId"]],
     ["list_bills", "outputSchema", ["results", "items", "targetId"]],
     ["list_bills", "outputSchema", ["results", "items", "tagIds", "items"]],
-    ["get_bill", "outputSchema", ["bill", "id"]],
-    ["get_bill", "outputSchema", ["bill", "bookId"]],
-    ["get_bill", "outputSchema", ["bill", "fromId"]],
-    ["get_bill", "outputSchema", ["bill", "targetId"]],
-    ["get_bill", "outputSchema", ["bill", "tagIds", "items"]],
-    ["delete_bills", "outputSchema", ["deleted", "items", "billId"]],
-    ["delete_reimbursement", "outputSchema", ["reimbursementBillId"]],
-  ] as const) {
+    ["get_bills", "outputSchema", ["items", "id"]],
+    ["get_bills", "outputSchema", ["items", "bookId"]],
+    ["get_bills", "outputSchema", ["items", "fromId"]],
+    ["get_bills", "outputSchema", ["items", "targetId"]],
+    ["get_bills", "outputSchema", ["items", "tagIds", "items"]],
+      ] as const) {
     const tool = tools.find(({ name }) => name === toolName);
     const node = schemaNode(tool?.[side], ...path);
     assert.equal(node.type, "string", `${toolName}.${side}.${path.join(".")} must be a string`);
     assert.equal(node.anyOf, undefined, `${toolName}.${side}.${path.join(".")} must not accept numbers`);
   }
   const discoveredIdPattern = new RegExp(String(schemaNode(
-    tools.find(({ name }) => name === "get_bill")?.inputSchema,
-    "billId",
+    tools.find(({ name }) => name === "get_bills")?.inputSchema,
+    "billIds",
+    "items",
   ).pattern));
   assert.equal(discoveredIdPattern.test("9223372036854775807"), true);
   assert.equal(discoveredIdPattern.test("9223372036854775808"), false);
@@ -705,7 +712,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     ["update_refund", "inputSchema", ["patch", "assetId"]],
     ["reimburse_bills", "inputSchema", ["assetId"]],
     ["list_bills", "outputSchema", ["results", "items", "assetId"]],
-    ["get_bill", "outputSchema", ["bill", "assetId"]],
+    ["get_bills", "outputSchema", ["items", "assetId"]],
   ] as const) {
     const node = schemaNode(tools.find(({ name }) => name === toolName)?.[side], ...path);
     assert.deepEqual((node.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["null", "string"]);
@@ -720,8 +727,8 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     ["update_transfer", "inputSchema", ["patch", "discount"]],
     ["list_bills", "outputSchema", ["results", "items", "fee"]],
     ["list_bills", "outputSchema", ["results", "items", "discount"]],
-    ["get_bill", "outputSchema", ["bill", "fee"]],
-    ["get_bill", "outputSchema", ["bill", "discount"]],
+    ["get_bills", "outputSchema", ["items", "fee"]],
+    ["get_bills", "outputSchema", ["items", "discount"]],
   ] as const) {
     assert.equal(schemaNode(tools.find(({ name }) => name === toolName)?.[side], ...path).type, "number");
   }
@@ -740,17 +747,17 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     ["update_transfer", ["patch", "money"]],
   ] as const) {
     const description = String(schemaNode(tools.find(({ name }) => name === toolName)?.inputSchema, ...path).description);
-    assert.match(description, /APP 主金额输入框.*转账手续费场景转出 money.*转入 money - fee/);
+    assert.match(description, /主金额口径.*转账手续费场景转出 money.*转入 money - fee/);
   }
-  const getBillOutput = tools.find(({ name }) => name === "get_bill")?.outputSchema as {
-    properties: { bill: { properties: Record<string, { pattern?: string }> } };
+  const getBillOutput = tools.find(({ name }) => name === "get_bills")?.outputSchema as {
+    items: { properties: Record<string, { pattern?: string }> };
   };
   for (const field of ["fromId", "targetId"]) {
-    assert.equal(getBillOutput.properties.bill.properties[field]?.pattern, POSITIVE_ID_PATTERN.source);
+    assert.equal(getBillOutput.items.properties[field]?.pattern, POSITIVE_ID_PATTERN.source);
   }
   for (const [toolName, path] of [
     ["list_bills", ["results", "items", "categoryId"]],
-    ["get_bill", ["bill", "categoryId"]],
+    ["get_bills", ["items", "categoryId"]],
   ] as const) {
     const categoryId = schemaNode(tools.find(({ name }) => name === toolName)?.outputSchema, ...path);
     assert.deepEqual((categoryId.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["null", "string"]);
@@ -805,26 +812,24 @@ test("get_budget 通过 MCP 返回已校验的只读预算结构", async (t) => 
 
   assert.equal(result.isError, undefined, JSON.stringify(result.content));
   assert.deepEqual(result.structuredContent, {
-    budget: {
-      period: {
-        kind: "year",
-        year: 2026,
-        startTime: Math.floor(Date.UTC(2026, 0, 1, -8) / 1000),
-        endTime: Math.floor(Date.UTC(2027, 0, 1, -8) / 1000) - 1,
-        timezoneOffsetSeconds: 28_800,
-      },
-      currency: "CNY",
-      configured: true,
-      summary: {
-        spendingScope: "allExpenses",
-        limit: 100,
-        used: 0,
-        remaining: 100,
-        excludedFromBudgetAmount: 0,
-        dailyAverageBudget: 100 / 365,
-      },
-      categories: [],
+    period: {
+      kind: "year",
+      year: 2026,
+      startTime: formatIsoTime(Math.floor(Date.UTC(2026, 0, 1, -8) / 1000)),
+      endTime: formatIsoTime(Math.floor(Date.UTC(2027, 0, 1, -8) / 1000) - 1),
+      timezoneOffsetSeconds: 28_800,
     },
+    currency: "CNY",
+    configured: true,
+    summary: {
+      spendingScope: "allExpenses",
+      limit: 100,
+      used: 0,
+      remaining: 100,
+      excludedFromBudgetAmount: 0,
+      dailyAverageBudget: 100 / 365,
+    },
+    categories: [],
   });
 });
 
@@ -840,7 +845,7 @@ test("普通 PAT 默认 legacy 可协商 2025-11-25", async (t) => {
   await client.connect(transport(app, token));
   assert.equal(client.getProtocolEra(), "legacy");
   assert.equal(client.getNegotiatedProtocolVersion(), "2025-11-25");
-  assert.equal((await client.listTools()).tools.length, 25);
+  assert.equal((await client.listTools()).tools.length, 26);
 });
 
 test("MCP 输入 schema 接受边界并在进入业务逻辑前拒绝越界字段", async (t) => {
@@ -883,7 +888,7 @@ test("MCP 输入 schema 接受边界并在进入业务逻辑前拒绝越界字�
     { name: "get_budget", arguments: { period: { kind: "year", year: 2026, month: 1 } } },
     { name: "list_bills", arguments: { bookId: -1, categoryId: -1 } },
     { name: "list_bills", arguments: { allBooks: true, assetId: "-1" } },
-    { name: "get_bill", arguments: { billId: 1 } },
+    { name: "get_bills", arguments: { billIds: [1] } },
     { name: "create_bills", arguments: { bills: [{ bookId: "1", type: 2, money: 0, categoryId: "2" }] } },
     { name: "create_bills", arguments: { bills: [{ bookId: "1", type: 0, money: 1, categoryId: "2", assetId: 0 }] } },
     { name: "create_bills", arguments: { bills: [{ bookId: "1", type: 0, money: 1, categoryId: "2", assetId: "-1" }] } },
@@ -909,10 +914,13 @@ test("MCP 输入 schema 接受边界并在进入业务逻辑前拒绝越界字�
     { name: "list_bills", arguments: { remarkKeyword: "   " } },
     { name: "list_bills", arguments: { remarkKeyword: "账".repeat(43) } },
     { name: "list_categories", arguments: { bookId: "9223372036854775808" } },
-    { name: "get_bill", arguments: { billId: "9223372036854775808" } },
+    { name: "get_bills", arguments: { billIds: ["9223372036854775808"] } },
+    { name: "get_bills", arguments: { billIds: [] } },
+    { name: "get_bills", arguments: { billIds: ["1", "2", "3"].concat(Array.from({ length: 98 }, (_, i) => String(i + 10))) } },
     { name: "list_bills", arguments: { assetId: "9223372036854775808" } },
     { name: "create_bills", arguments: { bills: [{ type: 0, money: 1, categoryId: "2", tagIds: ["tag-1", "tag-1"] }] } },
     { name: "list_bills", arguments: { assetId: 0 } },
+    { name: "get_bill_statistics", arguments: { range: { kind: "custom", startTime: "2026-01-01T00:00:00-12:00", endTime: "2026-01-01T02:00:00+14:00" } } },
     { name: "refresh_cache", arguments: { scope: "books" } },
   ]) {
     const result = await client.callTool(request);
@@ -956,17 +964,18 @@ test("get_user_info 只返回最小资料、缓存期 VIP 和额度字段", asyn
   await client.connect(transport(app, token));
 
   const result = await client.callTool({ name: "get_user_info", arguments: {} });
-  const user = (result.structuredContent as { user: Record<string, unknown> }).user;
+  const user = result.structuredContent as Record<string, unknown>;
   assert.deepEqual(user, {
     id: "uid-test",
     name: "模型可见名称",
     avatar: "https://example.invalid/avatar.png",
     registrationMethod: "邮箱",
-    registeredAt: now - 100,
+    registeredAt: formatIsoTime(now - 100),
     vipType: "终身VIP",
-    vipStart: now - 1,
-    vipEnd: now + 60,
+    vipStart: formatIsoTime(now - 1),
+    vipEnd: formatIsoTime(now + 60),
     baseCurrency: "CNY",
+    timeZone: "Asia/Shanghai",
     isVip: true,
   });
   assert.equal("platform" in user, false);
@@ -998,7 +1007,7 @@ test("get_user_info 将未开通 VIP 的官方时间哨兵返回为 null", async
   await client.connect(transport(app, token));
 
   const result = await client.callTool({ name: "get_user_info", arguments: {} });
-  const user = (result.structuredContent as { user: Record<string, unknown> }).user;
+  const user = result.structuredContent as Record<string, unknown>;
   assert.equal(user.vipStart, null);
   assert.equal(user.vipEnd, null);
   assert.equal(user.baseCurrency, "CNY");
@@ -1130,9 +1139,9 @@ test("64 位 bookId 在列表、分类和账单同步中精确往返", async (t)
   await client.connect(transport(app, token));
 
   const books = await client.callTool({ name: "list_books", arguments: { nameKeyword: "large" } });
-  assert.equal((books.structuredContent as { results: Array<{ bookId: string }> }).results[0]?.bookId, bookId);
+  assert.equal((books.structuredContent as Array<{ bookId: string }>)[0]?.bookId, bookId);
   const categories = await client.callTool({ name: "list_categories", arguments: { bookId, type: -1 } });
-  assert.deepEqual(categories.structuredContent, { results: [] });
+  assert.deepEqual(categories.structuredContent, []);
   const bills = await client.callTool({ name: "list_bills", arguments: { bookId } });
   assert.equal((bills.structuredContent as { results: Array<{ bookId: string }> }).results[0]?.bookId, bookId);
   assert.deepEqual(upstreamBookIds, [bookId, "-1"]);
@@ -1225,44 +1234,46 @@ test("64 位资产和分类 ID 以及非数字 groupId 精确往返", async (t) 
   await client.connect(transport(app, token));
 
   const assets = await client.callTool({ name: "list_assets", arguments: {} });
-  assert.deepEqual(assets.structuredContent, {
-    results: [{
+  assert.deepEqual(assets.structuredContent, [
+    {
       name: "常用",
-      children: [{
-        id: assetId,
-        name: "Asset",
-        currency: "CNY",
-        type: 1,
-        subtype: 0,
-        status: 0,
-        inCount: 1,
-      }],
-    }],
-  });
+      children: [
+        {
+          id: assetId,
+          name: "Asset",
+          currency: "CNY",
+          type: 1,
+          subtype: 0,
+          status: 0,
+          inCount: 1,
+        },
+      ],
+    },
+  ]);
   const assetsWithBalances = await client.callTool({ name: "list_assets", arguments: { includeBalances: true } });
-  assert.equal((assetsWithBalances.structuredContent as { results: Array<{ children: Array<{ money?: number }> }> }).results[0]!.children[0]!.money, 0);
+  assert.equal((assetsWithBalances.structuredContent as Array<{ children: Array<{ money?: number }> }>)[0]!.children[0]!.money, 0);
   const categories = await client.callTool({
     name: "list_categories",
     arguments: { bookId, type: -1 },
   });
-  assert.deepEqual(categories.structuredContent, {
-    results: [{
+  assert.deepEqual(categories.structuredContent, [
+    {
       id: categoryId,
       name: "Category",
       type: 0,
       level: 1,
       parentId: "-1",
       children: [{ id: childCategoryId, name: "Child", type: 0, level: 2, parentId: categoryId }],
-    }],
-  });
+    },
+  ]);
   const tags = await client.callTool({ name: "list_tags", arguments: {} });
-  assert.deepEqual(tags.structuredContent, {
-    results: [{
+  assert.deepEqual(tags.structuredContent, [
+    {
       groupId: "group.alpha",
       name: "项目",
       children: [{ id: "tag.alpha", name: "Alpha", status: 1 }],
-    }],
-  });
+    },
+  ]);
   const bills = await client.callTool({
     name: "list_bills",
     arguments: { bookId, categoryId },
@@ -1270,11 +1281,11 @@ test("64 位资产和分类 ID 以及非数字 groupId 精确往返", async (t) 
   assert.equal((bills.structuredContent as { results: Array<{ categoryId: string; assetId: string }> }).results[0]?.categoryId, categoryId);
   assert.equal((bills.structuredContent as { results: Array<{ categoryId: string; assetId: string }> }).results[0]?.assetId, assetId);
   assert.deepEqual((bills.structuredContent as { results: Array<{ tagIds: string[] }> }).results[0]?.tagIds, [tagId]);
-  const bill = await client.callTool({ name: "get_bill", arguments: { billId } });
-  const billContent = (bill.structuredContent as { bill: { fromId?: string; targetId: string } }).bill;
+  const bill = await client.callTool({ name: "get_bills", arguments: { billIds: [billId] } });
+  const billContent = (bill.structuredContent as Array<{ fromId?: string; targetId: string }>)[0]!;
   assert.equal("fromId" in billContent, false);
   assert.equal(billContent.targetId, assetId);
-  assert.deepEqual((bill.structuredContent as { bill: { tagIds: string[] } }).bill.tagIds, [tagId]);
+  assert.deepEqual((bill.structuredContent as Array<{ tagIds: string[] }>)[0]!.tagIds, [tagId]);
 });
 
 test("旧缓存中的数字引用 ID 按新契约输出字符串", async (t) => {
@@ -1330,19 +1341,19 @@ test("旧缓存中的数字引用 ID 按新契约输出字符串", async (t) => 
   t.after(() => client.close());
   await client.connect(transport(app, token));
 
-  const result = await client.callTool({ name: "get_bill", arguments: { billId } });
-  const returnedBill = (result.structuredContent as { bill: Record<string, unknown> }).bill;
+  const result = await client.callTool({ name: "get_bills", arguments: { billIds: [billId] } });
+  const returnedBill = (result.structuredContent as Array<Record<string, unknown>>)[0]!;
   assert.equal(returnedBill.categoryId, "2");
   assert.equal(returnedBill.assetId, null);
   assert.equal("fromId" in returnedBill, false);
   assert.equal("targetId" in returnedBill, false);
   assert.deepEqual(
-    (result.structuredContent as { bill: { tagIds: string[] } }).bill.tagIds,
+    (result.structuredContent as Array<{ tagIds: string[] }>)[0]!.tagIds,
     ["123"],
   );
 });
 
-test("get_bill 兼容上游省略 remark、assetId 和 updateTime", async (t) => {
+test("get_bills 兼容上游省略 remark、assetId 和 updateTime", async (t) => {
   const billId = "1770000000000123456";
   const { store, app, token } = setupApp({
     fetch: async (input) => {
@@ -1387,16 +1398,182 @@ test("get_bill 兼容上游省略 remark、assetId 和 updateTime", async (t) =>
   t.after(() => client.close());
   await client.connect(transport(app, token));
 
-  const result = await client.callTool({ name: "get_bill", arguments: { billId } });
+  const result = await client.callTool({ name: "get_bills", arguments: { billIds: [billId] } });
 
   assert.equal(result.isError, undefined, JSON.stringify(result.content));
-  const returned = (result.structuredContent as { bill: Record<string, unknown> }).bill;
+  const returned = (result.structuredContent as Array<Record<string, unknown>>)[0]!;
   assert.equal(returned.remark, "");
   assert.equal(returned.assetId, null);
   assert.equal("updateTime" in returned, false);
 });
 
-test("超级管理员 PAT 取得 25 个业务工具和 3 个 PAT 管理工具", async (t) => {
+test("get_bills 批量返回只包含存在的账单并保持输入顺序", async (t) => {
+  const firstId = "1770000000000123456";
+  const secondId = "1770000000000123457";
+  const thirdId = "1770000000000123458";
+  const { store, app, token } = setupApp({
+    fetch: async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/syncv2/pull") {
+        return Response.json({
+          ec: 200,
+          data: {
+            changes: [
+              {
+                id: firstId,
+                userid: "uid-test",
+                bookid: 1,
+                time: 1_770_000_000,
+                type: 0,
+                money: 1,
+                remark: "first",
+                status: 2,
+                cateid: 2,
+                createtime: 1_770_000_000,
+              },
+              {
+                id: secondId,
+                userid: "uid-test",
+                bookid: 1,
+                time: 1_770_000_100,
+                type: 1,
+                money: 2,
+                remark: "second",
+                status: 2,
+                cateid: 3,
+                createtime: 1_770_000_100,
+              },
+              {
+                id: thirdId,
+                userid: "uid-test",
+                bookid: 1,
+                time: 1_770_000_200,
+                type: 0,
+                money: 3,
+                remark: "third",
+                status: 2,
+                cateid: 2,
+                createtime: 1_770_000_200,
+              },
+            ],
+            deletes: [],
+            categories: [],
+            bookid: -1,
+            pageoffset: 0,
+            hasmore: 0,
+            count: 3,
+            pagesign: "",
+            lasttimes: { cursor: 1 },
+          },
+        });
+      }
+      throw new Error(`unexpected upstream path: ${path}`);
+    },
+  });
+  t.after(async () => {
+    await app.close();
+    store.close();
+  });
+  const client = new Client(
+    { name: "batch-get-bills", version: "1.0.0" },
+    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+  );
+  t.after(() => client.close());
+  await client.connect(transport(app, token));
+
+  const partial = await client.callTool({
+    name: "get_bills",
+    arguments: { billIds: [secondId, "1779999999999999999", firstId, secondId] },
+  });
+  assert.equal(partial.isError, undefined, JSON.stringify(partial.content));
+  const partialBills = partial.structuredContent as Array<{ id: string; remark: string }>;
+  assert.deepEqual(partialBills.map(({ id }) => id), [secondId, firstId]);
+  assert.equal(partialBills[0]!.remark, "second");
+  assert.equal(partialBills[1]!.remark, "first");
+
+  const single = await client.callTool({ name: "get_bills", arguments: { billIds: [thirdId] } });
+  const singleBills = single.structuredContent as Array<{ id: string }>;
+  assert.deepEqual(singleBills.map(({ id }) => id), [thirdId]);
+
+  const none = await client.callTool({
+    name: "get_bills",
+    arguments: { billIds: ["1778888888888888881", "1778888888888888882"] },
+  });
+  assert.equal(none.isError, undefined, JSON.stringify(none.content));
+  assert.deepEqual(none.structuredContent, []);
+});
+
+test("set_user_timezone 后输出时间按账号时区渲染并通过输出校验", async (t) => {
+  const billId = "1770000000000123456";
+  const { store, app, token } = setupApp();
+  const accountId = store.verifyPat(token)!.accountId!;
+  const account = store.requireAccount(accountId);
+  const now = Math.floor(Date.now() / 1000);
+  store.setUserCache(accountId, { id: account.uid, viptype: -1, vipstart: 0, vipend: 0, __baseCurrency: "CNY" }, now * 1000);
+  store.setCatalogCache(accountId, "books", "", [{ bookid: "1", name: "账本", visible: 1 }], now * 1000);
+  store.setCatalogCache(accountId, "categories", "1", [{ id: "2", name: "支出", type: 0 }], now * 1000);
+  store.setSyncState(accountId, { cursor: 1 });
+  store.applySyncBatch(accountId, {
+    changes: [{
+      id: billId,
+      userid: "uid-test",
+      bookid: 1,
+      time: 1_770_000_000,
+      type: 0,
+      money: 1,
+      remark: "ny-bill",
+      status: 2,
+      cateid: 2,
+      createtime: 1_770_000_000,
+    }],
+    deletes: [],
+    invalidatedCategoryScopes: [],
+    lasttimes: [],
+  });
+  t.after(async () => {
+    await app.close();
+    store.close();
+  });
+  const client = new Client(
+    { name: "timezone-render", version: "1.0.0" },
+    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+  );
+  t.after(() => client.close());
+  await client.connect(transport(app, token));
+
+  const invalid = await client.callTool({ name: "set_user_timezone", arguments: { timezone: "Mars/Olympus" } });
+  assert.equal(invalid.isError, true);
+  assert.match(JSON.stringify(invalid.content), /IANA 时区名称/);
+
+  const set = await client.callTool({ name: "set_user_timezone", arguments: { timezone: "America/New_York" } });
+  assert.equal(set.isError, undefined, JSON.stringify(set.content));
+  assert.deepEqual(set.structuredContent, { timezone: "America/New_York" });
+
+  // 字符串序与时刻序相反的合法跨偏移区间，修复前会被 refine 误拒
+  const statistics = await client.callTool({
+    name: "get_bill_statistics",
+    arguments: {
+      allBooks: true,
+      range: { kind: "custom", startTime: "2026-01-01T01:00:00+08:00", endTime: "2026-01-01T00:00:00-05:00" },
+    },
+  });
+  assert.equal(statistics.isError, undefined, JSON.stringify(statistics.content));
+  const range = (statistics.structuredContent as {
+    range: { startTime: string; endTime: string; timezoneOffsetSeconds: number };
+  }).range;
+  assert.equal(range.startTime, formatIsoTime(Math.floor(Date.parse("2026-01-01T01:00:00+08:00") / 1000), "America/New_York"));
+  assert.equal(range.endTime, formatIsoTime(Math.floor(Date.parse("2026-01-01T00:00:00-05:00") / 1000), "America/New_York"));
+  assert.equal(range.timezoneOffsetSeconds, -14_400);
+
+  const bills = await client.callTool({ name: "get_bills", arguments: { billIds: [billId] } });
+  assert.equal(bills.isError, undefined, JSON.stringify(bills.content));
+  const bill = (bills.structuredContent as Array<{ time: string; createTime: string }>)[0]!;
+  // 1_770_000_000 为 2026-02-02T02:40:00Z，纽约二月处于 EST（-05:00）
+  assert.equal(bill.time, "2026-02-01T21:40:00-05:00");
+  assert.equal(bill.createTime, "2026-02-01T21:40:00-05:00");
+});
+
+test("超级管理员 PAT 取得 26 个业务工具和 3 个 PAT 管理工具", async (t) => {
   const { store, app, token } = setupApp({
     role: "admin",
     bound: true,
@@ -1434,22 +1611,23 @@ test("超级管理员 PAT 取得 25 个业务工具和 3 个 PAT 管理工具", 
   const deletePatTool = tools.find(({ name }) => name === "delete_pat")!;
   const createPatProperties = createPatTool.inputSchema.properties as Record<string, unknown>;
   assert.deepEqual(tools.find(({ name }) => name === "list_pats")?.inputSchema.required, []);
-  assert.equal(schemaNode(tools.find(({ name }) => name === "list_pats")?.outputSchema, "results", "items", "id").type, "integer");
+  assert.equal(schemaNode(tools.find(({ name }) => name === "list_pats")?.outputSchema, "items", "id").type, "integer");
   assert.equal("scopes" in createPatProperties, false);
   const createPatAccountId = schemaNode(createPatTool.inputSchema, "accountId");
   const createPatExpiresAt = schemaNode(createPatTool.inputSchema, "expiresAt");
   assert.equal(String(createPatAccountId.description), "要关联的已有钱迹账号内部标识，null 表示暂不绑定");
   for (const field of [createPatAccountId, createPatExpiresAt]) {
-    assert.deepEqual((field.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["integer", "null"]);
     assert.equal("nullable" in field, false);
   }
+  assert.deepEqual((createPatAccountId.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["integer", "null"]);
+  assert.deepEqual((createPatExpiresAt.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["null", "string"]);
   assert.equal(createPatTool.description, "创建可选关联已有钱迹账号的普通用户 PAT");
   assert.equal(String(schemaNode(createPatTool.outputSchema, "pat", "token").description), "新创建且仅本次返回的完整明文 PAT");
   assert.equal(String(schemaNode(createPatTool.outputSchema, "message").description), "新 PAT 的用户交付模板");
   assert.equal(deletePatTool.annotations?.destructiveHint, true);
   assert.equal(deletePatTool.description, "永久删除普通用户 PAT，并在关联账号不再被其他 PAT 使用时删除其本地数据");
   const booksResult = await client.callTool({ name: "list_books", arguments: {} });
-  assert.deepEqual(booksResult.structuredContent, { results: [] });
+  assert.deepEqual(booksResult.structuredContent, []);
   const createdResult = await client.callTool({
     name: "create_pat",
     arguments: { remark: "张三的电脑" },
@@ -1472,13 +1650,13 @@ test("超级管理员 PAT 取得 25 个业务工具和 3 个 PAT 管理工具", 
   );
 
   const listedResult = await client.callTool({ name: "list_pats", arguments: {} });
-  const listed = listedResult.structuredContent as { results: Array<Record<string, unknown>> };
-  assert.equal(listed.results.some(({ id }) => id === created.pat.id), true);
-  assert.equal(listed.results.every((pat) => !("token" in pat)), true);
+  const listed = listedResult.structuredContent as Array<Record<string, unknown>>;
+  assert.equal(listed.some(({ id }) => id === created.pat.id), true);
+  assert.equal(listed.every((pat) => !("token" in pat)), true);
   assert.equal(cacheHeaders.every((value) => value === "no-store"), true);
 
   const deletedResult = await client.callTool({ name: "delete_pat", arguments: { id: created.pat.id } });
-  assert.deepEqual(deletedResult.structuredContent, { deleted: true, id: created.pat.id, accountDataDeleted: false });
+  assert.deepEqual(deletedResult.structuredContent, { deleted: true, accountDataDeleted: false });
   assert.equal(store.verifyPat(created.pat.token), undefined);
 
   const lastPat = store.createPat("最后关联账号", null);
@@ -1487,7 +1665,6 @@ test("超级管理员 PAT 取得 25 个业务工具和 3 个 PAT 管理工具", 
   const lastDeletedResult = await client.callTool({ name: "delete_pat", arguments: { id: lastPat.id } });
   assert.deepEqual(lastDeletedResult.structuredContent, {
     deleted: true,
-    id: lastPat.id,
     accountDataDeleted: true,
   });
   assert.throws(() => store.requireAccount(lastAccountId));
@@ -1571,6 +1748,7 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
   let dialogShown = 0;
   const loginInput = { value: "browser-user", disabled: false, focus() {}, select() {} };
   const passwordInput = { value: "正确密码🔐", disabled: false, focus() {}, select() {} };
+  const timezoneInput = { value: "", disabled: false };
   const submitLabel = { textContent: "登录并连接" };
   const submitButton = {
     disabled: false,
@@ -1601,6 +1779,7 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
     "#binding": form,
     "#login": loginInput,
     "#password": passwordInput,
+    "#timezone": timezoneInput,
     "#submit": submitButton,
     "#result": resultOutput,
     "#link-note": linkNote,
@@ -1618,6 +1797,12 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
     location: { pathname: "/connect", search: `?ticket=${ticket}` },
     history: { replaceState: (_state: unknown, _title: string, url: string) => { replacedUrl = url; } },
     document: { hidden: false, querySelector: (selector: string) => elements[selector] },
+    Intl: {
+      DateTimeFormat: class {
+        format() { return "2026年10月10日 12:00:00"; }
+        resolvedOptions() { return { timeZone: "Asia/Shanghai" }; }
+      },
+    },
     window: { close() {} },
     setTimeout: () => 1,
     clearTimeout() {},
@@ -1637,7 +1822,7 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
   assert.ok(submitHandler);
   await submitHandler({ preventDefault() {} });
   assert.equal(submittedAuthorization, `Bearer ${ticket}`);
-  assert.deepEqual(JSON.parse(submittedBody), { login: "browser-user", password: md5("正确密码🔐") });
+  assert.deepEqual(JSON.parse(submittedBody), { login: "browser-user", password: md5("正确密码🔐"), timezone: "Asia/Shanghai" });
   assert.equal(submittedBody.includes("正确密码🔐"), false);
   assert.equal(resultOutput.textContent, "连接失败，测试失败");
   assert.equal(loginInput.value, "browser-user");
@@ -1689,10 +1874,12 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
     addEventListener: (type: string, handler: () => void) => { if (type === "click") invalidCloseHandler = handler; },
   };
   const invalidFallback = { textContent: "", hidden: true, focus() {} };
+  const invalidTimezone = { value: "", disabled: false };
   const invalidElements: Record<string, unknown> = {
     "#binding": invalidForm,
     "#login": invalidLogin,
     "#password": invalidPassword,
+    "#timezone": invalidTimezone,
     "#submit": invalidSubmit,
     "#result": invalidResult,
     "#link-note": { textContent: "", hidden: true },
@@ -1708,6 +1895,12 @@ test("连接页只显示账号密码，隐藏一次性凭证并显著反馈成�
     location: { pathname: "/connect", search: `?ticket=${ticket}` },
     history: { length: 2, replaceState() {}, back: () => { historyBackCount += 1; } },
     document: { hidden: false, querySelector: (selector: string) => invalidElements[selector] },
+    Intl: {
+      DateTimeFormat: class {
+        format() { return "2026年10月10日 12:00:00"; }
+        resolvedOptions() { return { timeZone: "Asia/Shanghai" }; }
+      },
+    },
     window: { close: () => { windowCloseCount += 1; } },
     setTimeout: (handler: () => void) => { handler(); return 1; },
     clearTimeout() {},
@@ -2073,7 +2266,7 @@ test("主动连接工具签发链接，解绑仅在最后一个 PAT 时级联本
   await clients[1]!.connect(transport(app, second.token));
 
   const link = await clients[0]!.callTool({ name: "connect_qianji", arguments: {} });
-  const linkOutput = link.structuredContent as { url: string; expiresAt: number; message: string };
+  const linkOutput = link.structuredContent as { url: string; expiresAt: string; message: string };
   assert.match(new URL(linkOutput.url).searchParams.get("ticket") ?? "", /^[a-f0-9]{64}$/);
   assert.equal(
     linkOutput.message.slice(0, linkOutput.message.indexOf("钱迹绑定链接已生成：")),
@@ -2081,7 +2274,7 @@ test("主动连接工具签发链接，解绑仅在最后一个 PAT 时级联本
   );
   assertConnectionLinkUserMessage(linkOutput.message, linkOutput.url);
   assert.deepEqual(JSON.parse(link.content[0]?.type === "text" ? link.content[0].text : "null"), linkOutput);
-  assert.equal(linkOutput.expiresAt > Math.floor(Date.now() / 1000), true);
+  assert.match(linkOutput.expiresAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+08:00$/);
 
   const retained = await clients[0]!.callTool({ name: "disconnect_qianji", arguments: {} });
   assert.deepEqual(retained.structuredContent, { disconnected: true, accountDataDeleted: false });
@@ -2243,7 +2436,8 @@ for (const protocol of ["2026-07-28", "2025-11-25"] as const) {
       }
       const result = await client.callTool({ name: "list_books", arguments: {} });
       assert.equal(result.isError, undefined, JSON.stringify(result));
-      assert.deepEqual(result.structuredContent, { results: [] });
+      // 2025-11-25 客户端会把裸数组 structuredContent 兼容包装为 { result: [...] }
+      assert.deepEqual(result.structuredContent, protocol === "2026-07-28" ? [] : { result: [] });
       assert.equal(elicitationCount, protocol === "2026-07-28" ? 1 : 0);
       assert.equal(store.verifyPat(token)?.uid, scenario.bound ? "uid-test" : "elicited-uid");
       assert.equal(bookCalls, scenario.tokenExpired ? 2 : 1);
@@ -2325,6 +2519,7 @@ test("优雅停机只执行一次并按 HTTP、MCP、数据库顺序关闭", asy
         calls.push("http");
         return server.close(callback);
       },
+      closeIdleConnections: () => server.closeIdleConnections?.(),
     },
     app: { close: async () => { calls.push("mcp"); } },
     store: { close: () => { calls.push("database"); } },

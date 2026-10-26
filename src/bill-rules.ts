@@ -142,11 +142,6 @@ export interface ReimburseBillsInput {
   currencyConversion?: Omit<CurrencyConversionInput, "sourceCurrency">;
 }
 
-export interface DeleteBillInput {
-  billId: BillIdInput;
-  cascadeRelatedBills?: boolean;
-}
-
 export type StatisticsRangeInput =
   | { kind: "month"; year: number; month: number }
   | { kind: "year"; year: number }
@@ -170,7 +165,7 @@ export interface ListBillsResult {
   nextCursor: string | null;
 }
 
-/** 读取账单保存的跨币种对象，字段不完整或无效时拒绝伪造金额语义。 */
+/** 读取账单保存的跨币种对象，字段不完整或无效时拒绝伪造金额语义 */
 export function currencyExtra(raw: Record<string, unknown>): Record<string, unknown> | undefined {
   const value = billExtra(raw).curr;
   if (value === undefined || value === null) return undefined;
@@ -180,7 +175,7 @@ export function currencyExtra(raw: Record<string, unknown>): Record<string, unkn
   return value as Record<string, unknown>;
 }
 
-/** 校验并公开账单保存的跨币种金额，禁止无效上游值进入缓存或统计。 */
+/** 校验并公开账单保存的跨币种金额，禁止无效上游值进入缓存或统计 */
 export function validatedCurrencyConversion(raw: Record<string, unknown>): Record<string, unknown> | undefined {
   const curr = currencyExtra(raw);
   if (!curr) return undefined;
@@ -223,36 +218,38 @@ function addOptionalCurrencyAmount(
 export const MAX_MONEY = 9_999_999_999.99;
 export const MAX_SEARCH_KEYWORD_LENGTH = 42;
 export const MAX_BILL_CURSOR_LENGTH = 65_536;
+/** 不透明业务 ID 文本的最大长度：真实 ID 最长 19 位十进制，64 封顶使游标最坏组合仍低于 MAX_BILL_CURSOR_LENGTH */
+export const MAX_OPAQUE_ID_LENGTH = 64;
 
-/** 规范化账单 ID，并拒绝会丢失精度的 JavaScript 数字表示。 */
+/** 规范化账单 ID，并拒绝会丢失精度的 JavaScript 数字表示 */
 export function normalizeBillId(value: BillIdInput): string {
   if (!isPositiveLongId(value)) throw new AppError("INVALID_BILL_ID", "账单 ID 无效");
   return value;
 }
 
-/** 规范化账本 ID，并保留钱迹使用的 `-1` 默认账本哨兵值。 */
+/** 规范化账本 ID，并保留钱迹使用的 `-1` 默认账本哨兵值 */
 export function normalizeBookId(value: BookIdInput): string {
   if (!isOptionalPositiveLongId(value)) throw new AppError("INVALID_BOOK_ID", "账本 ID 无效");
   return value;
 }
 
-/** 规范化必选分类 ID。 */
+/** 规范化必选分类 ID */
 export function normalizeCategoryId(value: ReferenceIdInput): string {
   return normalizeReferenceId(value, "分类", "INVALID_CATEGORY_ID", false);
 }
 
-/** 规范化可为空的资产 ID，其中 `-1` 表示未选择资产。 */
+/** 规范化可为空的资产 ID，其中 `-1` 表示未选择资产 */
 export function normalizeAssetId(value: ReferenceIdInput | null): string {
   if (value === null) return "-1";
   return normalizeReferenceId(value, "资产", "INVALID_ASSET_ID", true);
 }
 
-/** 规范化转账等场景要求的必选资产 ID。 */
+/** 规范化转账等场景要求的必选资产 ID */
 export function normalizeRequiredAssetId(value: ReferenceIdInput): string {
   return normalizeReferenceId(value, "资产", "INVALID_ASSET_ID", false);
 }
 
-/** 按资源约束验证引用 ID，避免把不安全数字送入钱迹协议。 */
+/** 按资源约束验证引用 ID，避免把不安全数字送入钱迹协议 */
 function normalizeReferenceId(
   value: ReferenceIdInput,
   resource: string,
@@ -264,17 +261,17 @@ function normalizeReferenceId(
   return value;
 }
 
-/** 生成钱迹约定的 64 位客户端账单 ID，并以十进制字符串保持精度。 */
+/** 生成钱迹约定的 64 位客户端账单 ID，并以十进制字符串保持精度 */
 export function createBillId(epochMs = Date.now()): string {
   return (BigInt(epochMs) * 1_000_000n + BigInt(randomInt(100_000, 200_000))).toString();
 }
 
-/** 校验业务金额为有限正数、最多两位小数且不超过钱迹上限。 */
+/** 校验业务金额为有限正数、最多两位小数且不超过钱迹上限 */
 export function requirePositiveMoney(value: number, label: string): void {
   requireMoney(value, label, false);
 }
 
-/** 校验可为零的手续费、优惠或换算金额。 */
+/** 校验可为零的手续费、优惠或换算金额 */
 export function requireNonnegativeMoney(value: number, label: string): void {
   requireMoney(value, label, true);
 }
@@ -289,7 +286,7 @@ function requireMoney(value: number, label: string, allowZero: boolean): void {
   }
 }
 
-/** 将账单的手续费或优惠折算为钱迹单一的 `transfee` 字段。 */
+/** 将账单的手续费或优惠折算为钱迹单一的 `transfee` 字段 */
 export function billAdjustment(money: number, fee: number, discount: number): number {
   requirePositiveMoney(money, "账单金额");
   requireNonnegativeMoney(fee, "手续费");
@@ -300,12 +297,12 @@ export function billAdjustment(money: number, fee: number, discount: number): nu
   return fee > 0 ? fee : -discount;
 }
 
-/** 将 APP 主金额输入值转换为钱迹持久化的原始账单金额。 */
+/** 将 APP 主金额输入值转换为钱迹持久化的原始账单金额 */
 export function storedBillMoney(inputMoney: number, adjustment: number): number {
   return decimalSubtract(inputMoney, Math.abs(adjustment));
 }
 
-/** 从钱迹原始账单金额还原 APP 主金额输入值。 */
+/** 从钱迹原始账单金额还原 APP 主金额输入值 */
 export function inputBillMoney(rawMoney: unknown, adjustment: unknown): number {
   const money = numericAmount(rawMoney);
   const feeOrDiscount = adjustment === undefined || adjustment === null ? 0 : numericAmount(adjustment);
@@ -315,7 +312,7 @@ export function inputBillMoney(rawMoney: unknown, adjustment: unknown): number {
   return decimalAdd(money, Math.abs(feeOrDiscount));
 }
 
-/** 将两个账单标记开关合并为钱迹内部位值，省略的维度保留现值。 */
+/** 将两个账单标记开关合并为钱迹内部位值，省略的维度保留现值 */
 export function resolveBillFlag(
   currentFlag: unknown,
   input: { excludeFromIncomeExpense?: boolean; excludeFromBudget?: boolean },
@@ -326,7 +323,7 @@ export function resolveBillFlag(
   return ((excludeFromIncomeExpense ? 1 : 0) | (excludeFromBudget ? 2 : 0)) as 0 | 1 | 2 | 3;
 }
 
-/** 判断同步回来的转账是否完整应用了请求补丁。 */
+/** 判断同步回来的转账是否完整应用了请求补丁 */
 export function transferPatchApplied(
   raw: Record<string, unknown>,
   patch: UpdateTransferPatch,
@@ -355,14 +352,14 @@ export function transferPatchApplied(
   return true;
 }
 
-/** 安全读取账单的 `extra` 对象，缺失或类型异常时返回空对象。 */
+/** 安全读取账单的 `extra` 对象，缺失或类型异常时返回空对象 */
 export function billExtra(raw: Record<string, unknown>): Record<string, unknown> {
   return raw.extra && typeof raw.extra === "object" && !Array.isArray(raw.extra)
     ? raw.extra as Record<string, unknown>
     : {};
 }
 
-/** 将钱迹的关系映射转换为账单 ID 与金额映射。 */
+/** 将钱迹的关系映射转换为账单 ID 与金额映射 */
 export function relationshipMap(value: unknown): Map<string, number> {
   if (value === undefined || value === null) return new Map();
   if (typeof value !== "object" || Array.isArray(value)) {
@@ -383,7 +380,7 @@ function numericAmount(value: unknown): number | undefined {
   return Number.isFinite(result) ? result : undefined;
 }
 
-/** 按官方兼容顺序读取新旧退款关系。 */
+/** 按官方兼容顺序读取新旧退款关系 */
 export function refundRelationshipMap(raw: Record<string, unknown>): Map<string, number> {
   const extra = billExtra(raw);
   const current = relationshipMap(extra.rfds);
@@ -398,7 +395,7 @@ export function refundRelationshipMap(raw: Record<string, unknown>): Map<string,
   return money === 0 ? new Map() : new Map([[refundId, money]]);
 }
 
-/** 读取新版报销关系，旧版只提供是否已报销标记，没有子账单 ID。 */
+/** 读取新版报销关系，旧版只提供是否已报销标记，没有子账单 ID */
 export function reimbursementRelationshipMap(raw: Record<string, unknown>): Map<string, number> {
   return relationshipMap(billExtra(raw).bxs);
 }
@@ -412,12 +409,12 @@ export function hasReimbursement(raw: Record<string, unknown>): boolean {
   return Number(raw.type) === 5 && (reimbursementRelationshipMap(raw).size > 0 || Number(extra.baoxiaoed) === 1);
 }
 
-/** 汇总关系映射中的金额。 */
+/** 汇总关系映射中的金额 */
 export function relationshipTotal(value: Map<string, number>): number {
   return [...value.values()].reduce((total, money) => decimalAdd(total, money), 0);
 }
 
-/** 从关系字段读取源账单 ID，并将上游脏数据转换为稳定错误。 */
+/** 从关系字段读取源账单 ID，并将上游脏数据转换为稳定错误 */
 export function relationshipSourceId(value: unknown, relation: string): string {
   try {
     return publicBillId("id", value);
@@ -426,14 +423,14 @@ export function relationshipSourceId(value: unknown, relation: string): string {
   }
 }
 
-/** 判断关系值是否为有效的正整数 ID。 */
+/** 判断关系值是否为有效的正整数 ID */
 function positiveRelationshipValue(value: unknown): boolean {
   if (value === undefined || value === null) return false;
   const text = isRawJsonNumber(value) ? JSON.stringify(value) : String(value);
   return isPositiveLongId(text);
 }
 
-/** 校验退款场景、源分类和创建时的条数上限。 */
+/** 校验退款场景、源分类和创建时的条数上限 */
 export function validateRefundSource(source: Record<string, unknown>, enforceCountLimit: boolean): void {
   if (![0, 5].includes(Number(source.type))) {
     throw new AppError("BILL_SCENARIO_MISMATCH", "退款源账单只允许普通支出 type 0 或待报销支出 type 5");
@@ -447,7 +444,7 @@ export function validateRefundSource(source: Record<string, unknown>, enforceCou
   }
 }
 
-/** 构造钱迹退款接口接受的最小字段集合。 */
+/** 构造钱迹退款接口接受的最小字段集合 */
 export function refundPayload(
   input: CreateRefundInput,
   assetId: string,
@@ -463,7 +460,7 @@ export function refundPayload(
   return payload;
 }
 
-/** 判断同步回来的退款账单是否符合预期字段。 */
+/** 判断同步回来的退款账单是否符合预期字段 */
 export function refundPatchApplied(raw: Record<string, unknown>, expected: CreateRefundInput): boolean {
   return relationshipSourceId(billExtra(raw).refundsid, "退款") === expected.sourceBillId &&
     Number(raw.type) === 20 &&
@@ -474,7 +471,7 @@ export function refundPatchApplied(raw: Record<string, unknown>, expected: Creat
     tagIdsFrom(raw).join("\0") === (expected.tagIds ?? []).join("\0");
 }
 
-/** 将允许修改的普通账单字段写入完整上游对象。 */
+/** 将允许修改的普通账单字段写入完整上游对象 */
 export function applyPatch(
   raw: Record<string, unknown>,
   patch: UpdateBillPatch,
@@ -499,7 +496,7 @@ export function applyPatch(
   }
 }
 
-/** 读取账单标签并保持钱迹不透明 ID 的原始字符串。 */
+/** 读取账单标签并保持钱迹不透明 ID 的原始字符串 */
 export function tagIdsFrom(raw: Record<string, unknown>): string[] {
   const extra = raw.extra;
   if (!extra || typeof extra !== "object" || Array.isArray(extra)) return [];
@@ -507,7 +504,7 @@ export function tagIdsFrom(raw: Record<string, unknown>): string[] {
   return Array.isArray(tags) ? tags.map(publicOpaqueId) : [];
 }
 
-/** 按 APK 同步结果逐项识别已成功、冲突和未确认账单。 */
+/** 按 APK 同步结果逐项识别已成功、冲突和未确认账单 */
 export function inspectWriteResult(
   result: SyncBillResult,
   expectedIds: string[],
@@ -555,7 +552,7 @@ export function inspectWriteResult(
   return { appliedIds, error: new AppError("WRITE_FAILED", `钱迹账单写入失败，逐项结果：${statuses}`, 502) };
 }
 
-/** 判断普通账单同步结果是否完整应用了请求补丁。 */
+/** 判断普通账单同步结果是否完整应用了请求补丁 */
 export function patchWasApplied(
   raw: Record<string, unknown>,
   patch: UpdateBillPatch,
@@ -565,7 +562,7 @@ export function patchWasApplied(
 ): boolean {
   if (patch.bookId !== undefined && String(raw.bookid) !== normalizeBookId(patch.bookId)) return false;
   if (patch.time !== undefined && Number(raw.time) !== patch.time) return false;
-  // 钱迹用 type 5 表示待报销支出，取消待报销后应恢复为普通支出类型。
+  // 钱迹用 type 5 表示待报销支出，取消待报销后应恢复为普通支出类型
   if (patch.reimbursable !== undefined && (Number(raw.type) === 5) !== patch.reimbursable) return false;
   if (expectedStoredMoney !== undefined && Number(raw.money) !== expectedStoredMoney) return false;
   if (adjustment !== undefined && Number(billExtra(raw).transfee ?? 0) !== adjustment) return false;
@@ -583,7 +580,7 @@ export function patchWasApplied(
   return true;
 }
 
-/** 按公开字段语义校验并转换账单相关 ID。 */
+/** 按公开字段语义校验并转换账单相关 ID */
 export function publicBillId(field: string, value: unknown): string {
   const input = isRawJsonNumber(value) ? JSON.stringify(value) : value;
   if (typeof input !== "string" && typeof input !== "number") {
@@ -600,7 +597,7 @@ export function publicBillId(field: string, value: unknown): string {
   }
 }
 
-/** 将标签等不透明 ID 转换为非空字符串。 */
+/** 将标签等不透明 ID 转换为非空字符串 */
 export function publicOpaqueId(value: unknown): string {
   const text = isRawJsonNumber(value)
     ? JSON.stringify(value)
@@ -611,7 +608,7 @@ export function publicOpaqueId(value: unknown): string {
   return text;
 }
 
-/** 将记账人 ID 转换为精确文本，并保留旧账单的空所有者。 */
+/** 将记账人 ID 转换为精确文本，并保留旧账单的空所有者 */
 export function publicUserId(value: unknown): string {
   if (value === undefined || value === null || value === "") return "";
   if (typeof value === "number" && !Number.isSafeInteger(value)) {

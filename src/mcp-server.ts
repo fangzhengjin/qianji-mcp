@@ -26,7 +26,8 @@ import {
   PARENT_ID_PATTERN,
   POSITIVE_ID_PATTERN,
 } from "./ids.ts";
-import { MAX_BILL_CURSOR_LENGTH, MAX_MONEY, MAX_SEARCH_KEYWORD_LENGTH } from "./bill-rules.ts";
+import { MAX_BILL_CURSOR_LENGTH, MAX_MONEY, MAX_OPAQUE_ID_LENGTH, MAX_SEARCH_KEYWORD_LENGTH } from "./bill-rules.ts";
+import { DEFAULT_TIME_ZONE, formatIsoTime, isValidTimeZone, parseIsoTime } from "./time.ts";
 import { MoneyTrackService } from "./qianji-service.ts";
 import serverInstructions from "./server-instructions.md" with { type: "text" };
 
@@ -68,8 +69,8 @@ const knownBillTypeSchema = z.union([
   z.literal(22).describe("报销批次汇总记录（由客户端构造用于合并展示，不是单笔报销入账）"),
 ]).describe("钱迹账单类型");
 const billFlagOutputSchemas = {
-  excludeFromIncomeExpense: z.boolean().describe("是否不计入收支统计，对应钱迹 APP 的“不计收支”选项"),
-  excludeFromBudget: z.boolean().describe("是否不计入预算，对应钱迹 APP 的“不计预算”选项"),
+  excludeFromIncomeExpense: z.boolean().describe("是否不计入收支统计"),
+  excludeFromBudget: z.boolean().describe("是否不计入预算"),
 };
 const billFlagCreateSchemas = {
   excludeFromIncomeExpense: z.boolean().optional().default(false)
@@ -83,7 +84,7 @@ const billFlagPatchSchemas = {
   excludeFromBudget: z.boolean().optional()
     .describe("新的不计预算状态"),
 };
-const opaqueIdText = z.string().min(1);
+const opaqueIdText = z.string().min(1).max(MAX_OPAQUE_ID_LENGTH);
 const tagIdsSchema = z.array(opaqueIdText).max(100).describe("标签 ID 列表");
 const writeTagIdsSchema = z.array(opaqueIdText).max(8)
   .refine((ids) => new Set(ids).size === ids.length, "标签 ID 不能重复")
@@ -174,7 +175,7 @@ const assetStatusSchema = z.union([
 ]).describe("资产状态");
 const moneyUnitDescription = "使用币种主单位，不使用分、美分等最小货币单位，例如 CNY 8100 表示 8100 元，USD 63 表示 63 美元，JPY 500 表示 500 日元";
 const billInputMoneyDescription = `默认使用所选资产币种，传 currencyConversion.sourceCurrency 时使用该来源币种，未选择资产且未指定来源币种时使用钱迹本位币，${moneyUnitDescription}`;
-const adjustmentMoneyDescription = "对应钱迹 APP 主金额输入框：普通支出实际扣款为 money - discount，转账手续费场景转出 money、转入 money - fee，转账优惠场景转出 money - discount、转入 money";
+const adjustmentMoneyDescription = "主金额口径：普通支出实际扣款为 money - discount，转账手续费场景转出 money、转入 money - fee，转账优惠场景转出 money - discount、转入 money";
 const billAdjustmentMoneyDescription = `${adjustmentMoneyDescription}，${billInputMoneyDescription}`;
 const sourceAssetMoneyDescription = `使用转出资产币种，${moneyUnitDescription}`;
 const transferMoneyDescription = `${adjustmentMoneyDescription}，${sourceAssetMoneyDescription}`;
@@ -182,6 +183,10 @@ const sourceBillMoneyDescription = `使用源账单币种，${moneyUnitDescripti
 const billAssetIdDescription = "主关联资产 ID，用于收支、退款、报销入账和借贷资金账户，没有主关联资产时为 null";
 const billFromIdDescription = "来源关联资产 ID，用于转账、信用卡还款和部分借贷流水，上游未返回时省略";
 const billTargetIdDescription = "目标关联资产 ID，用于转账、信用卡还款和部分借贷流水，上游未返回时省略";
+const inputTimeDescription = "带时区偏移的 ISO 8601 时刻，例如 2026-07-26T23:43:38+08:00";
+const isoTimeSchema = z.string().datetime({ offset: true });
+const outputTimeDescription = "带时区偏移的 ISO 8601 时刻，偏移按当前记账时区渲染，例如 2026-07-26T23:43:38+08:00";
+const isoTimeOutputSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
 
 const bookSchema = z.object({
   bookId: bookIdText.describe("账本 ID"),
@@ -199,7 +204,7 @@ const assetSchema = z.object({
   id: positiveIdText.describe("资产 ID"),
   name: z.string().describe("资产名称"),
   money: z.number().optional().describe(`资产当前余额，仅当 list_assets.includeBalances=true 时返回，${moneyUnitDescription}`),
-  currency: currencySymbolSchema.describe("资产币种标识，钱迹原始值为空时按 APK 规则返回当前本位币"),
+  currency: currencySymbolSchema.describe("资产币种标识，钱迹原始值为空时返回当前本位币"),
   type: z.number().int().describe("钱迹资产一级类型代码：1 资金，2 信用卡，3 充值，4 投资，5 债务记录，6 债务汇总，7 社会保障，其他值由钱迹动态目录定义"),
   subtype: z.number().int().describe("钱迹资产子类型代码：51 借入，52 借出，61 借入汇总，62 借出汇总，其他值由钱迹动态目录定义"),
   status: assetStatusSchema,
@@ -210,7 +215,7 @@ const assetSchema = z.object({
       type: repaymentRuleTypeSchema,
       value: z.number().int().positive().describe("固定还款日或账单日后的天数"),
     }).optional().describe("信用账户还款规则"),
-    nextRepaymentDate: z.number().int().nonnegative().optional().describe("按钱迹规则计算的下一还款日，UTC+08:00 当日零点 Unix 秒"),
+    nextRepaymentDate: isoTimeOutputSchema.optional().describe(`按钱迹规则计算的下一还款日，记账时区当日零点，${outputTimeDescription}`),
     limit: z.number().nonnegative().optional().describe(`信用额度，仅当 list_assets.includeBalances=true 时返回，${moneyUnitDescription}`),
   }).optional().describe("仅信用账户返回的账单日、还款规则和下一还款日，额度仅在 includeBalances=true 时返回"),
 });
@@ -245,13 +250,13 @@ const billRelationshipSchemas = {
   refundBillIds: z.array(positiveIdText).optional().describe("源账单关联的退款账单 ID 列表"),
   refundProgress: z.object({
     totalAmount: z.number().nonnegative().describe("累计退款金额，使用源账单币种且保留超额退款事实"),
-    remainingAmount: z.number().nonnegative().describe("按 APK 口径计算的剩余可退款金额，使用源账单币种且超额退款后为 0"),
+    remainingAmount: z.number().nonnegative().describe("剩余可退款金额，使用源账单币种且超额退款后为 0"),
   }).optional().describe("源账单存在退款关系时返回的退款进度"),
   reimbursementSourceBillId: positiveIdText.optional().describe("报销来源账单 ID，仅报销子账单返回"),
   reimbursementBillIds: z.array(positiveIdText).optional().describe("源账单关联的报销账单 ID 列表"),
   reimbursementProgress: z.object({
     totalAmount: z.number().nonnegative().describe("累计报销金额，使用源账单币种且保留超额报销事实"),
-    remainingAmount: z.number().nonnegative().describe("按 APK 口径扣除退款和报销后的剩余可报销金额，使用源账单币种且超额报销后为 0"),
+    remainingAmount: z.number().nonnegative().describe("扣除退款和报销后的剩余可报销金额，使用源账单币种且超额报销后为 0"),
   }).optional().describe("源账单存在报销关系时返回的报销进度"),
 };
 const currencyConversionSchema = z.object({
@@ -259,7 +264,7 @@ const currencyConversionSchema = z.object({
   sourceAmount: z.number().describe("用户输入的来源币种主金额，手续费或优惠由账单自身字段解释"),
   targetCurrency: currencySymbolSchema.optional().describe("入账资产或转入资产使用的目标币种标识，没有目标资产时省略"),
   targetAmount: z.number().optional().describe("写入目标资产的换算金额，仅在 targetCurrency 存在时返回"),
-  baseCurrency: currencySymbolSchema.optional().describe("该账单写入时的钱迹账户本位币标识，APK 省略与来源币种重复的本位信息时省略"),
+  baseCurrency: currencySymbolSchema.optional().describe("该账单写入时的钱迹账户本位币标识，钱迹省略与来源币种重复的本位信息时省略"),
   baseAmount: z.number().optional().describe("该账单写入时保存的本位币金额，与 baseCurrency 同时出现，历史统计不按最新价格重算"),
 }).describe("账单写入时保存的完整跨币种结果，同币种且钱迹未生成 extra.curr 时整体省略");
 const billAttributionSchemas = {
@@ -276,9 +281,9 @@ const billAttributionSchemas = {
 const billFields = {
   id: positiveIdText.describe("账单 ID 的十进制字符串"),
   bookId: bookIdText.describe("账本 ID"),
-  time: z.number().int().describe("账单发生时间，Unix 秒"),
+  time: isoTimeOutputSchema.describe(`账单发生时间，${outputTimeDescription}`),
   type: knownBillTypeSchema,
-  money: z.number().describe(`普通支出、转账或信用卡还款对应 APP 主金额输入框，其他类型为钱迹业务金额，${moneyUnitDescription}`),
+  money: z.number().describe(`普通支出、转账或信用卡还款为用户输入的主金额，其他类型为钱迹业务金额，${moneyUnitDescription}`),
   fee: z.number().nonnegative().optional().describe(`转账或信用卡还款手续费，包含在 money 中，转入金额为 money - fee，其他类型省略，${moneyUnitDescription}`),
   discount: z.number().nonnegative().optional().describe(`普通支出、转账或信用卡还款优惠，实际支出或转出金额为 money - discount，其他类型省略，${moneyUnitDescription}`),
   categoryId: positiveIdText.nullable().describe("分类 ID，不需要分类的账单为 null"),
@@ -296,8 +301,8 @@ const billSummarySchema = z.object({
 });
 const billSchema = z.object({
   ...billFields,
-  createTime: z.number().int().describe("账单创建时间，Unix 秒"),
-  updateTime: z.number().int().optional().describe("账单更新时间，Unix 秒"),
+  createTime: isoTimeOutputSchema.describe(`账单创建时间，${outputTimeDescription}`),
+  updateTime: isoTimeOutputSchema.optional().describe(`账单更新时间，${outputTimeDescription}`),
   tagIds: z.array(z.string()).optional().describe("标签 ID 列表"),
 });
 const patMetadataSchema = z.object({
@@ -306,8 +311,8 @@ const patMetadataSchema = z.object({
   uid: z.string().nullable().describe("关联的钱迹用户 ID，null 表示未绑定"),
   role: patRoleSchema,
   remark: z.string().describe("用于识别 PAT 的备注"),
-  expiresAt: z.number().int().positive().nullable().describe("PAT 过期时间，Unix 秒，null 表示永不过期"),
-  createdAt: z.number().int().positive().describe("PAT 创建时间，Unix 秒"),
+  expiresAt: isoTimeOutputSchema.nullable().describe(`PAT 过期时间，${outputTimeDescription}，null 表示永不过期`),
+  createdAt: isoTimeOutputSchema.describe(`PAT 创建时间，${outputTimeDescription}`),
 });
 const createdPatSchema = patMetadataSchema.extend({
   token: z.string().describe("新创建且仅本次返回的完整明文 PAT"),
@@ -317,11 +322,12 @@ const userInfoFields = {
   name: z.string().describe("钱迹用户名称"),
   avatar: z.string().describe("头像 URL，未设置时为空字符串"),
   registrationMethod: registrationMethodSchema.optional().describe("钱迹账号注册方式，上游代码无法识别时不返回"),
-  registeredAt: z.number().int().nonnegative().describe("注册时间，Unix 秒"),
+  registeredAt: isoTimeOutputSchema.describe(`注册时间，${outputTimeDescription}`),
   vipType: vipTypeSchema.describe("钱迹会员类型名称，未知的有效会员类型统一显示为 VIP，不暴露上游代码"),
-  vipStart: z.number().int().nonnegative().nullable().describe("VIP 生效时间，Unix 秒，未开通时为 null"),
-  vipEnd: z.number().int().nonnegative().nullable().describe("VIP 失效时间，Unix 秒，该秒起视为过期，未开通时为 null"),
+  vipStart: isoTimeOutputSchema.nullable().describe(`VIP 生效时间，${outputTimeDescription}，未开通时为 null`),
+  vipEnd: isoTimeOutputSchema.nullable().describe(`VIP 失效时间，${outputTimeDescription}，该时刻起视为过期，未开通时为 null`),
   baseCurrency: currencySymbolSchema.describe("当前钱迹账户本位币标识，跨币种记账和默认统计口径均以此为准"),
+  timeZone: z.string().describe("账号当前记账时区的 IANA 名称，统计分桶、预算期间、写入额度和时间渲染均按该时区执行，可用 set_user_timezone 修改"),
 };
 
 const billCurrencyInputSchema = z.strictObject({
@@ -345,13 +351,13 @@ const userInfoSchema = z.discriminatedUnion("isVip", [
     dailyWriteLimit: z.number().int().nonnegative().describe("当日成功业务写入上限，单位为次"),
     dailyWriteUsed: z.number().int().nonnegative().describe("当日已用成功业务写入次数，单位为次"),
     dailyWriteRemaining: z.number().int().nonnegative().describe("当日剩余成功业务写入次数，单位为次"),
-    dailyWriteResetsAt: z.number().int().nonnegative().describe("额度在 Asia/Shanghai 次日零点重置的 Unix 秒"),
+    dailyWriteResetsAt: isoTimeOutputSchema.describe(`额度在记账时区次日零点重置，${outputTimeDescription}`),
   }),
 ]);
 
 const createInput = z.strictObject({
   bookId: defaultBookIdText,
-  time: z.number().int().nonnegative().optional().describe("账单发生时间，Unix 秒，省略时使用服务器当前时间"),
+  time: isoTimeSchema.optional().describe(`账单发生时间，${inputTimeDescription}，省略时使用服务器当前时间`),
   type: simpleBillTypeSchema,
   money: positiveMoneySchema.describe(billAdjustmentMoneyDescription),
   discount: nonnegativeMoneySchema.optional()
@@ -373,7 +379,7 @@ const patchSchema = z
   .strictObject({
     bookId: bookIdText.optional()
       .describe("新的账本 ID"),
-    time: z.number().int().nonnegative().optional().describe("新的账单发生时间，Unix 秒"),
+    time: isoTimeSchema.optional().describe(`新的账单发生时间，${inputTimeDescription}`),
     money: positiveMoneySchema.optional().describe(`新的${billAdjustmentMoneyDescription}`),
     discount: nonnegativeMoneySchema.optional()
       .describe(`新的支出优惠金额，传 0 表示清除优惠，${billInputMoneyDescription}`),
@@ -393,7 +399,7 @@ const patchSchema = z
 
 const createTransferInput = z.strictObject({
   bookId: defaultBookIdText,
-  time: z.number().int().nonnegative().optional().describe("转账或还款发生时间，Unix 秒，省略时使用服务器当前时间"),
+  time: isoTimeSchema.optional().describe(`转账或还款发生时间，${inputTimeDescription}，省略时使用服务器当前时间`),
   money: positiveMoneySchema.describe(transferMoneyDescription),
   fromAssetId: positiveIdText.describe("转出资产 ID"),
   targetAssetId: positiveIdText.describe("转入资产 ID"),
@@ -415,7 +421,7 @@ const createTransferInput = z.strictObject({
 });
 const transferPatchSchema = z.strictObject({
   bookId: bookIdText.optional().describe("新的账本 ID"),
-  time: z.number().int().nonnegative().optional().describe("新的转账或还款时间，Unix 秒"),
+  time: isoTimeSchema.optional().describe(`新的转账或还款时间，${inputTimeDescription}`),
   money: positiveMoneySchema.optional().describe(`新的${transferMoneyDescription}`),
   fromAssetId: positiveIdText.optional().describe("新的转出资产 ID"),
   targetAssetId: positiveIdText.optional().describe("新的转入资产 ID"),
@@ -437,7 +443,7 @@ const transferPatchSchema = z.strictObject({
   .meta({ required: [] });
 const refundFields = {
   money: positiveMoneySchema.describe(`退款金额，${sourceBillMoneyDescription}`),
-  time: z.number().int().nonnegative().optional().describe("退款发生时间，Unix 秒，创建时省略则使用服务器当前时间与源账单时间加 1 秒的较大值"),
+  time: isoTimeSchema.optional().describe(`退款发生时间，${inputTimeDescription}，创建时省略则使用服务器当前时间与源账单时间加 1 秒的较大值`),
   assetId: optionalAssetIdInputText.optional().describe("退款入账资产 ID，省略时使用源账单资产，null 表示不指定资产"),
   remark: z.string().max(500).optional().describe("退款备注"),
   tagIds: writeTagIdsSchema.optional().describe("退款标签 ID 列表"),
@@ -446,7 +452,7 @@ const refundFields = {
 };
 const refundPatchSchema = z.strictObject({
   money: refundFields.money.optional().describe(`新的退款金额，${sourceBillMoneyDescription}`),
-  time: refundFields.time.describe("新的退款发生时间，Unix 秒"),
+  time: refundFields.time.describe(`新的退款发生时间，${inputTimeDescription}`),
   assetId: refundFields.assetId.describe("新的退款入账资产 ID，null 表示清除资产"),
   remark: refundFields.remark.describe("新的退款备注"),
   tagIds: refundFields.tagIds.describe("完整替换后的退款标签 ID 列表，空数组表示清除"),
@@ -463,7 +469,7 @@ const debtAccountSchema = z.object({
   balance: z.number().nonnegative().describe("当前剩余余额的非负展示值，使用 currency 指定的币种主单位"),
   startDate: z.string().describe("开始日期，上游未设置时为空字符串"),
   endDate: z.string().describe("计划还款或收款日期，与 status 是否 ended 无直接关系，上游未设置时为空字符串"),
-  finishedAt: z.number().int().positive().optional().describe("实际结束时间，Unix 秒，仅 status=ended 且钱迹记录了结束时间时返回"),
+  finishedAt: isoTimeOutputSchema.optional().describe(`实际结束时间，${outputTimeDescription}，仅 status=ended 且钱迹记录了结束时间时返回`),
   totalPaid: z.number().nonnegative().describe("借入已还金额或借出已收金额的非负展示值，使用 currency 指定的币种主单位"),
 });
 
@@ -475,10 +481,10 @@ const statisticsRangeSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({ kind: z.literal("year").describe("按自然年统计"), year: z.number().int().min(1970).max(9999).describe("统计年份") }),
   z.strictObject({
-    kind: z.literal("custom").describe("按自定义 Unix 秒区间统计"),
-    startTime: z.number().int().nonnegative().describe("自定义统计起点，Unix 秒，包含边界"),
-    endTime: z.number().int().nonnegative().describe("自定义统计终点，Unix 秒，包含边界"),
-  }).refine(({ startTime, endTime }) => startTime <= endTime, "startTime 不能晚于 endTime"),
+    kind: z.literal("custom").describe("按自定义时间区间统计"),
+    startTime: isoTimeSchema.describe(`自定义统计起点，${inputTimeDescription}，包含边界`),
+    endTime: isoTimeSchema.describe(`自定义统计终点，${inputTimeDescription}，包含边界`),
+  }).refine(({ startTime, endTime }) => Date.parse(startTime) <= Date.parse(endTime), "startTime 不能晚于 endTime"),
   z.strictObject({ kind: z.literal("all").describe("统计所选账本的全部账单时间范围") }),
 ]);
 const statisticsSummarySchema = z.object({
@@ -487,8 +493,8 @@ const statisticsSummarySchema = z.object({
   balance: z.number().describe("结余，固定为 totalIncome - totalSpend"),
   pureIncome: z.number().describe("收入和借出利息收入扣除关联退款后的正数部分，不含报销收入和退款收入"),
   pureSpend: z.number().describe("支出和借入利息支出扣除关联退款后的正数部分，不含报销支出、退款支出和手续费"),
-  transferAmount: z.number().describe("转账的 APK 统计金额总额：同币种使用扣除手续费或优惠后的保存金额，跨币种使用所选统计币种的历史换算金额，仅展示资金流转，不计入总收支"),
-  creditRepaymentAmount: z.number().describe("信用卡还款的 APK 统计金额总额：同币种使用扣除手续费或优惠后的保存金额，跨币种使用所选统计币种的历史换算金额，仅展示还款，不重复计入总收支"),
+  transferAmount: z.number().describe("转账的统计金额总额：同币种使用扣除手续费或优惠后的保存金额，跨币种使用所选统计币种的历史换算金额，仅展示资金流转，不计入总收支"),
+  creditRepaymentAmount: z.number().describe("信用卡还款的统计金额总额：同币种使用扣除手续费或优惠后的保存金额，跨币种使用所选统计币种的历史换算金额，仅展示还款，不重复计入总收支"),
   reimbursementAmount: z.number().describe("待报销源账单扣除关联退款后不低于 0 的报销基数，本身不直接计入总收支"),
   reimbursementIncome: z.number().describe("已报销金额超过报销基数的正差额，计入总收入"),
   reimbursementSpend: z.number().describe("已有报销关系的待报销源账单中，报销基数超过已报销金额的正差额，计入总支出"),
@@ -497,8 +503,8 @@ const statisticsSummarySchema = z.object({
   refundSpend: z.number().describe("收入或借出利息收入的关联退款超过源金额形成的正差额，计入总支出"),
   feeAmount: z.number().describe("未标记不计收支账单的正 transfee 合计，计入总支出"),
   discountAmount: z.number().describe("未标记不计收支账单的负 transfee 绝对值合计，仅展示优惠规模，不再从总支出重复扣减"),
-  excludedFromIncomeExpenseAmount: z.number().describe("标记为不计收支的主金额合计，其中普通收支和债务利息使用扣除关联退款后的正数部分，待报销支出使用报销差额或未报销主金额，不进入总收支，转账、还款和退款子账单不计入此字段"),
-  excludedFromBudgetAmount: z.number().describe("标记为不计预算的主金额合计，其中普通收支和债务利息使用扣除关联退款后的正数部分，待报销支出使用报销差额或未报销主金额，这些金额仍可能计入收支，转账、还款和退款子账单不计入此字段"),
+  excludedFromIncomeExpenseAmount: z.number().describe("标记为不计收支的主金额合计，按扣除关联退款后的正数部分计入，不含转账、还款和退款子账单"),
+  excludedFromBudgetAmount: z.number().describe("标记为不计预算的主金额合计，按扣除关联退款后的正数部分计入，仍计入收支，不含转账、还款和退款子账单"),
 });
 const categoryStatSchema: z.ZodType = z.lazy(() => z.object({
   categoryId: positiveIdText.optional().describe("真实分类 ID，特殊债务利息行省略"),
@@ -511,13 +517,13 @@ const categoryStatSchema: z.ZodType = z.lazy(() => z.object({
 }));
 const statisticsOutputSchema = z.object({
   range: z.object({
-    startTime: z.number().int().describe("实际统计起点，Unix 秒，包含边界"),
-    endTime: z.number().int().describe("实际统计终点，Unix 秒，包含边界"),
-    timezoneOffsetSeconds: z.literal(28_800).describe("日期分桶固定使用 UTC+08:00"),
+    startTime: isoTimeOutputSchema.describe(`实际统计起点，${outputTimeDescription}，包含边界`),
+    endTime: isoTimeOutputSchema.describe(`实际统计终点，${outputTimeDescription}，包含边界`),
+    timezoneOffsetSeconds: z.number().int().describe("日期分桶所用记账时区的当刻偏移秒数"),
   }).describe("实际使用的统计时间范围"),
   currency: currencySymbolSchema.describe("响应中全部金额使用的币种标识，未指定时为当前本位币"),
   availableCurrencies: z.array(currencySymbolSchema).describe("应用其他筛选后可选的来源币种标识集合，并包含当前本位币"),
-  summary: statisticsSummarySchema.describe("按 APK 口径计算的总额明细"),
+  summary: statisticsSummarySchema.describe("总额明细"),
   counts: z.object({
     matchedBillCount: z.number().int().nonnegative().describe("应用全部筛选后的原始账单条数，包括不贡献总收支的转账、还款和不计收支账单"),
     incomeItemCount: z.number().int().nonnegative().describe("实际产生正收入分量的条目数，不等同于账单总数"),
@@ -525,12 +531,12 @@ const statisticsOutputSchema = z.object({
     reimbursementBillCount: z.number().int().nonnegative().describe("参与报销金额统计的待报销源账单条数"),
   }).describe("匹配账单及实际收入、支出、报销条目计数"),
   average: z.object({
-    unit: statisticsUnitSchema.describe("APK 按范围选择的平均和时间序列期间单位"),
-    periodCount: z.number().int().nonnegative().describe("平均值分母，其中 unit=day 时，自然月只计已经完整结束的日历日，跨度不超过 365 天的自定义范围以 startTime 为起点，以 endTime 后一秒与当前 UTC+08:00 自然日零点中的较早者为终点，每满 86400 秒计 1 个期间，范围内无账单的期间也计入，因此进行中的当天不计入，仅查询当天时即使有账单也可能为 0，而 unit=month/year 时只计有账单期间，跨度超过 365 天的自定义范围使用 year"),
+    unit: statisticsUnitSchema.describe("按统计范围选择的平均和时间序列期间单位"),
+    periodCount: z.number().int().nonnegative().describe("平均值分母，unit=day 时只计已完整结束的日历日且无账单的期间也计入，unit=month/year 时只计有账单的期间，跨度超过 365 天的自定义范围使用 year 粒度"),
     income: z.number().describe("totalIncome / periodCount，分母为 0 时为 0"),
     spend: z.number().describe("totalSpend / periodCount，分母为 0 时为 0"),
     balance: z.number().describe("平均收入减平均支出"),
-  }).describe("APK 按范围选择的期间平均值"),
+  }).describe("按统计范围选择的期间平均值"),
   categoryBreakdown: z.object({
     spend: z.array(categoryStatSchema).describe("支出分类构成，仅含支出、借入利息支出和待报销支出的报销差额，不含手续费和退款支出，按金额降序"),
     income: z.array(categoryStatSchema).describe("收入分类构成，仅含收入和借出利息收入，不含报销收入和退款收入，按金额降序"),
@@ -549,8 +555,8 @@ const statisticsOutputSchema = z.object({
       income: z.number().describe("该期间总收入"),
       spend: z.number().describe("该期间总支出"),
       balance: z.number().describe("该期间收入减支出"),
-    })).describe("按 UTC+08:00 分桶且不补空期间的时间序列"),
-  }).describe("按 APK 选择的日期粒度汇总趋势"),
+    })).describe("按当前记账时区分桶且不补空期间的时间序列"),
+  }).describe("按统计范围选择的日期粒度汇总趋势"),
 });
 
 const budgetPeriodInputSchema = z.discriminatedUnion("kind", [
@@ -565,9 +571,9 @@ const budgetPeriodInputSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 const budgetRangeFields = {
-  startTime: z.number().int().describe("实际预算期间起点，Unix 秒，包含边界"),
-  endTime: z.number().int().describe("实际预算期间终点，Unix 秒，包含边界"),
-  timezoneOffsetSeconds: z.literal(28_800).describe("预算日期固定使用 UTC+08:00"),
+  startTime: isoTimeOutputSchema.describe(`实际预算期间起点，${outputTimeDescription}，包含边界`),
+  endTime: isoTimeOutputSchema.describe(`实际预算期间终点，${outputTimeDescription}，包含边界`),
+  timezoneOffsetSeconds: z.number().int().describe("预算日期所用记账时区的当刻偏移秒数"),
 };
 const budgetPeriodOutputSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -618,14 +624,14 @@ const budgetOutputSchema = z.object({
   summary: budgetSummarySchema.nullable().describe("预算总览，没有配置预算时为 null"),
   categories: z.array(budgetCategorySchema).describe("按一级分类与直属二级分类组织的预算明细，未设置预算的分类不返回"),
   dailyStatistics: z.array(z.object({
-    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("UTC+08:00 日历日期，格式为 YYYY-MM-DD"),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("记账时区日历日期，格式为 YYYY-MM-DD"),
     spend: z.number().nonnegative().describe("当日预算支出，按 spendingScope 统计并排除不计预算金额"),
     cumulativeSpend: z.number().nonnegative().describe("从预算期间起点到当日的累计预算支出"),
     remaining: z.number().describe("当日结束后的预算剩余额度，固定为 summary.limit - cumulativeSpend，负数表示超支"),
   })).optional().describe("逐日预算统计，仅 includeDailyStatistics=true 时返回并补齐期间内每个日历日"),
 });
 
-/** 创建钱迹业务工具，并为管理员追加 PAT 管理工具。 */
+/** 创建钱迹业务工具，并为管理员追加 PAT 管理工具 */
 export function createMoneyTrackMcp(
   service: MoneyTrackService,
   store: DataStore,
@@ -644,7 +650,7 @@ export function createMoneyTrackMcp(
       inputSchema: z.strictObject({}).meta({ required: [] }),
       outputSchema: z.object({
         url: z.string().url().describe("一次性钱迹登录链接"),
-        expiresAt: z.number().int().positive().describe("链接失效时间，Unix 秒"),
+        expiresAt: isoTimeOutputSchema.describe(`链接失效时间，${outputTimeDescription}`),
         message: z.string().describe("钱迹登录链接的用户提示语"),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -656,7 +662,7 @@ export function createMoneyTrackMcp(
         ...link,
         message: `请只向用户原样返回下方内容，不要省略、改写、重排或补充说明，不要输出本段提示\n\n${link.message}`,
       };
-    }, ctx, principal, bindingTickets),
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -682,7 +688,32 @@ export function createMoneyTrackMcp(
       bindingTickets.revokePat(principal.patId);
       const result = await service.unbindAccount(principal.patId, current.accountId);
       return { disconnected: true as const, accountDataDeleted: result.localDataDeleted };
-    }, ctx, principal, bindingTickets),
+    }, ctx, principal, bindingTickets, store),
+  );
+
+  server.registerTool(
+    "set_user_timezone",
+    {
+      description: "设置当前钱迹账号的记账时区，影响统计分桶、预算期间、写入额度归属日、还款日零点和时间展示，调用本工具前必须先与用户确认",
+      inputSchema: z.strictObject({
+        timezone: z.string().min(1).max(64).describe("IANA 时区名称，例如 Asia/Shanghai、America/New_York、Europe/London"),
+      }),
+      outputSchema: z.object({
+        timezone: z.string().describe("设置后的 IANA 时区名称"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ timezone }, ctx) => toolResult(async () => {
+      const current = await requirePatPrincipal(principal, store);
+      if (current.accountId === null) {
+        throw new AppError("QIANJI_ACCOUNT_NOT_BOUND", "绑定钱迹账号后才能设置记账时区", 409);
+      }
+      if (!isValidTimeZone(timezone)) {
+        throw new AppError("INVALID_TIME_ZONE", "timezone 必须是有效的 IANA 时区名称，例如 Asia/Shanghai 或 America/New_York");
+      }
+      await store.setAccountTimeZone(current.accountId, timezone);
+      return { timezone };
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -695,13 +726,13 @@ export function createMoneyTrackMcp(
         nameKeyword: searchKeywordSchema.optional()
           .describe("用于匹配账本名称且不区分大小写的字面子串"),
       }).meta({ required: [] }),
-      outputSchema: z.object({ results: z.array(bookSchema).describe("账本列表") }),
+      outputSchema: z.array(bookSchema).describe("账本列表"),
       annotations: readAnnotations,
     },
     async ({ includeHidden, nameKeyword }, ctx) =>
-      toolResult(async () => ({
-        results: await service.listBooks(await userId(principal, store), includeHidden, nameKeyword),
-      }), ctx, principal, bindingTickets),
+      toolResult(async () =>
+        await service.listBooks(await userId(principal, store), includeHidden, nameKeyword),
+      ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -711,12 +742,12 @@ export function createMoneyTrackMcp(
       inputSchema: z.strictObject({
         bookId: defaultBookIdText,
       }).meta({ required: [] }),
-      outputSchema: z.object({ results: z.array(bookMemberSchema).describe("账本成员列表") }),
+      outputSchema: z.array(bookMemberSchema).describe("账本成员列表"),
       annotations: readAnnotations,
     },
-    async ({ bookId }, ctx) => toolResult(async () => ({
-      results: await service.listBookMembers(await userId(principal, store), bookId),
-    }), ctx, principal, bindingTickets),
+    async ({ bookId }, ctx) => toolResult(async () =>
+      await service.listBookMembers(await userId(principal, store), bookId),
+    ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -731,13 +762,13 @@ export function createMoneyTrackMcp(
         nameKeyword: z.string().trim().min(1).optional()
           .describe("用于匹配资产名称且不区分大小写的字面子串，不匹配分组名、机构字段或别名"),
       }).meta({ required: [] }),
-      outputSchema: z.object({ results: z.array(assetGroupSchema).describe("固定两级资产分组") }),
+      outputSchema: z.array(assetGroupSchema).describe("固定两级资产分组"),
       annotations: readAnnotations,
     },
     async ({ includeHidden, includeBalances, nameKeyword }, ctx) =>
-      toolResult(async () => ({
-        results: await service.listAssets(await userId(principal, store), includeHidden, includeBalances, nameKeyword),
-      }), ctx, principal, bindingTickets),
+      toolResult(async () =>
+        await service.listAssets(await userId(principal, store), includeHidden, includeBalances, nameKeyword),
+      ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -748,12 +779,12 @@ export function createMoneyTrackMcp(
         direction: debtDirectionSchema,
         status: debtStatusSchema,
       }),
-      outputSchema: z.object({ results: z.array(debtAccountSchema).describe("符合方向和状态的借入或借出记录列表") }),
+      outputSchema: z.array(debtAccountSchema).describe("符合方向和状态的借入或借出记录列表"),
       annotations: readAnnotations,
     },
-    async ({ direction, status }, ctx) => toolResult(async () => ({
-      results: await service.listDebtAccounts(await userId(principal, store), direction, status),
-    }), ctx, principal, bindingTickets),
+    async ({ direction, status }, ctx) => toolResult(async () =>
+      await service.listDebtAccounts(await userId(principal, store), direction, status),
+    ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -769,13 +800,13 @@ export function createMoneyTrackMcp(
         ]).optional().default(-1)
           .describe("分类范围"),
       }).meta({ required: [] }),
-      outputSchema: z.object({ results: z.array(categorySchema).describe("固定两级分类树") }),
+      outputSchema: z.array(categorySchema).describe("固定两级分类树"),
       annotations: readAnnotations,
     },
     async ({ bookId, type }, ctx) =>
-      toolResult(async () => ({
-        results: await service.listCategories(await userId(principal, store), bookId, type),
-      }), ctx, principal, bindingTickets),
+      toolResult(async () =>
+        await service.listCategories(await userId(principal, store), bookId, type),
+      ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -790,13 +821,13 @@ export function createMoneyTrackMcp(
         ]).optional().default(1)
           .describe("标签状态范围"),
       }).meta({ required: [] }),
-      outputSchema: z.object({ results: z.array(tagGroupSchema).describe("固定两级标签分组") }),
+      outputSchema: z.array(tagGroupSchema).describe("固定两级标签分组"),
       annotations: readAnnotations,
     },
     async ({ status }, ctx) =>
-      toolResult(async () => ({
-        results: await service.listTags(await userId(principal, store), status),
-      }), ctx, principal, bindingTickets),
+      toolResult(async () =>
+        await service.listTags(await userId(principal, store), status),
+      ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -804,12 +835,12 @@ export function createMoneyTrackMcp(
     {
       description: "返回当前钱迹用户、账户本位币、VIP 状态及适用时的当日写入额度信息",
       inputSchema: z.strictObject({}).meta({ required: [] }),
-      outputSchema: z.object({ user: userInfoSchema.describe("当前钱迹用户信息") }),
+      outputSchema: userInfoSchema.describe("当前钱迹用户信息"),
       annotations: readAnnotations,
     },
-    async (_input, ctx) => toolResult(async () => ({
-      user: await service.getUserInfo(await userId(principal, store)),
-    }), ctx, principal, bindingTickets),
+    async (_input, ctx) => toolResult(async () =>
+      await service.getUserInfo(await userId(principal, store)),
+    ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -830,7 +861,7 @@ export function createMoneyTrackMcp(
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (_input, ctx) =>
-      toolResult(async () => service.refreshCache(await userId(principal, store)), ctx, principal, bindingTickets),
+      toolResult(async () => service.refreshCache(await userId(principal, store)), ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -844,14 +875,14 @@ export function createMoneyTrackMcp(
             description: "是否查询全部账本，启用时忽略 bookId",
             default: false,
           }),
-          startTime: z.number().int().nonnegative().optional()
-            .describe("账单发生时间下限，Unix 秒，包含边界"),
-          endTime: z.number().int().nonnegative().optional()
-            .describe("账单发生时间上限，Unix 秒，包含边界"),
-          createStartTime: z.number().int().nonnegative().optional()
-            .describe("账单创建时间下限，Unix 秒，包含边界，与账单发生时间不同"),
-          createEndTime: z.number().int().nonnegative().optional()
-            .describe("账单创建时间上限，Unix 秒，包含边界，与账单发生时间不同"),
+          startTime: isoTimeSchema.optional()
+            .describe(`账单发生时间下限，${inputTimeDescription}，包含边界`),
+          endTime: isoTimeSchema.optional()
+            .describe(`账单发生时间上限，${inputTimeDescription}，包含边界`),
+          createStartTime: isoTimeSchema.optional()
+            .describe(`账单创建时间下限，${inputTimeDescription}，包含边界，与账单发生时间不同`),
+          createEndTime: isoTimeSchema.optional()
+            .describe(`账单创建时间上限，${inputTimeDescription}，包含边界，与账单发生时间不同`),
           type: knownBillTypeSchema.optional().describe("账单类型筛选"),
           types: z.array(knownBillTypeSchema).min(1).max(100).optional()
             .describe("多个账单类型筛选"),
@@ -934,36 +965,45 @@ export function createMoneyTrackMcp(
       annotations: readAnnotations,
     },
     async (input, ctx) => toolResult(async () => {
-      const { bills, nextCursor } = await service.listBills(await userId(principal, store), input);
+      const { startTime, endTime, createStartTime, createEndTime, ...rest } = input;
+      const { bills, nextCursor } = await service.listBills(await userId(principal, store), {
+        ...rest,
+        ...(startTime !== undefined ? { startTime: parseIsoTime(startTime, "startTime") } : {}),
+        ...(endTime !== undefined ? { endTime: parseIsoTime(endTime, "endTime") } : {}),
+        ...(createStartTime !== undefined ? { createStartTime: parseIsoTime(createStartTime, "createStartTime") } : {}),
+        ...(createEndTime !== undefined ? { createEndTime: parseIsoTime(createEndTime, "createEndTime") } : {}),
+      });
       return { results: bills, nextCursor };
-    }, ctx, principal, bindingTickets),
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
-    "get_bill",
+    "get_bills",
     {
-      description: "按账单 ID 返回完整账单详情",
-      inputSchema: z.strictObject({ billId: positiveIdText.describe("账单 ID") }),
-      outputSchema: z.object({ bill: billSchema.describe("完整账单") }),
+      description: "按账单 ID 列表批量返回完整账单，只返回存在的账单，缺失的 ID 不会出现在结果中，调用方需自行比对请求与返回的 ID，重复 ID 去重",
+      inputSchema: z.strictObject({
+        billIds: z.array(positiveIdText).min(1).max(100).describe("账单 ID 列表"),
+      }),
+      outputSchema: z.array(billSchema).describe("完整账单列表，只包含存在的账单，顺序与输入一致"),
       annotations: readAnnotations,
     },
-    async ({ billId }, ctx) =>
-      toolResult(async () => ({
-        bill: await service.getBill(await userId(principal, store), billId),
-      }), ctx, principal, bindingTickets),
+    async ({ billIds }, ctx) =>
+      toolResult(async () =>
+        await service.getBills(await userId(principal, store), billIds),
+      ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
     "get_bill_statistics",
     {
-      description: "聚合本地账单并返回固定统计结果，金额统计采用钱迹 APK 已确认的主报表规则，日均分母只计已经完整结束的日历日",
+      description: "聚合本地账单并返回固定统计结果，金额统计采用钱迹主报表规则，日均分母只计已经完整结束的日历日",
       inputSchema: z.strictObject({
         bookId: defaultBookIdText,
         allBooks: z.boolean().optional().meta({
           description: "是否统计全部账本，启用时忽略 bookId",
           default: false,
         }),
-        range: statisticsRangeSchema.describe("统计范围，按 UTC+08:00 解释月份和年份"),
+        range: statisticsRangeSchema.describe("统计范围，按当前记账时区解释月份和年份"),
         memberIds: z.array(opaqueIdText).min(1).max(100).optional()
           .describe("共享账本记账人用户 ID 列表，匹配任一成员"),
         currency: currencySymbolSchema.optional().describe("来源币种标识筛选和统计结果币种，传入时只统计以该币种记账的账单并按该币种汇总，省略时不筛选来源币种并按当前本位币汇总"),
@@ -979,12 +1019,22 @@ export function createMoneyTrackMcp(
           default: true,
         }),
       }),
-      outputSchema: z.object({ statistics: statisticsOutputSchema.describe("钱迹主报表固定结构统计结果") }),
+      outputSchema: statisticsOutputSchema.describe("钱迹主报表固定结构统计结果"),
       annotations: readAnnotations,
     },
-    async (input, ctx) => toolResult(async () => ({
-      statistics: await service.getBillStatistics(await userId(principal, store), input),
-    }), ctx, principal, bindingTickets),
+    async (input, ctx) => toolResult(async () => {
+      const { range, ...rest } = input;
+      return await service.getBillStatistics(await userId(principal, store), range.kind === "custom"
+        ? {
+            ...rest,
+            range: {
+              ...range,
+              startTime: parseIsoTime(range.startTime, "range.startTime"),
+              endTime: parseIsoTime(range.endTime, "range.endTime"),
+            },
+          }
+        : { ...rest, range });
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1000,12 +1050,12 @@ export function createMoneyTrackMcp(
           default: false,
         }),
       }).meta({ required: [] }),
-      outputSchema: z.object({ budget: budgetOutputSchema.describe("钱迹预算页口径的预算使用情况") }),
+      outputSchema: budgetOutputSchema.describe("钱迹预算页口径的预算使用情况"),
       annotations: readAnnotations,
     },
-    async (input, ctx) => toolResult(async () => ({
-      budget: await service.getBudget(await userId(principal, store), input),
-    }), ctx, principal, bindingTickets),
+    async (input, ctx) => toolResult(async () =>
+      await service.getBudget(await userId(principal, store), input),
+    ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1015,11 +1065,13 @@ export function createMoneyTrackMcp(
       inputSchema: z.strictObject({
         bills: z.array(createInput).min(1).max(100).describe("待创建账单列表"),
       }),
-      outputSchema: z.object({ bills: z.array(billSchema).describe("创建后同步确认的完整账单列表，顺序与输入一致") }),
+      outputSchema: z.array(billSchema).describe("创建后同步确认的完整账单列表，顺序与输入一致"),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ bills }, ctx) =>
-      toolResult(async () => service.createBills(await userId(principal, store), bills), ctx, principal, bindingTickets),
+      toolResult(async () => (await service.createBills(await userId(principal, store), bills.map(({ time, ...rest }) =>
+        time === undefined ? rest : { ...rest, time: parseIsoTime(time, "bills[].time") },
+      ))).bills, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1032,34 +1084,28 @@ export function createMoneyTrackMcp(
           patch: patchSchema.describe("账单字段补丁"),
         })).min(1).max(100).describe("待修改账单列表"),
       }),
-      outputSchema: z.object({ bills: z.array(billSchema).describe("修改后同步确认的完整账单列表，顺序与输入一致") }),
+      outputSchema: z.array(billSchema).describe("修改后同步确认的完整账单列表，顺序与输入一致"),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async ({ updates }, ctx) =>
-      toolResult(async () => service.updateBills(await userId(principal, store), updates), ctx, principal, bindingTickets),
+      toolResult(async () => (await service.updateBills(await userId(principal, store), updates.map(({ billId, patch }) => {
+        const { time, ...rest } = patch;
+        return { billId, patch: time === undefined ? rest : { ...rest, time: parseIsoTime(time, "updates[].patch.time") } };
+      }))).bills, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
     "delete_bills",
     {
-      description: "批量永久删除普通收支、待报销支出、转账或信用卡还款账单",
+      description: "批量永久删除普通收支、待报销支出、转账或信用卡还款账单，并自动连带删除其退款和报销关联子账单",
       inputSchema: z.strictObject({
-        deletions: z.array(z.strictObject({
-          billId: positiveIdText.describe("要永久删除的账单 ID"),
-          cascadeRelatedBills: z.boolean().optional().default(false)
-            .describe("是否同时删除该源账单的全部退款和报销关联账单"),
-        })).min(1).max(100).describe("待删除账单列表"),
+        billIds: z.array(positiveIdText).min(1).max(100).describe("要永久删除的账单 ID 列表"),
       }),
-      outputSchema: z.object({
-        deleted: z.array(z.object({
-          billId: positiveIdText.describe("已删除的源账单 ID 十进制字符串"),
-          relatedBillIds: z.array(positiveIdText).describe("同时删除的退款和报销子账单 ID，未级联时为空数组"),
-        })).describe("已删除范围，顺序与输入一致"),
-      }),
+      outputSchema: z.object({ deleted: z.literal(true).describe("全部账单删除成功") }),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ deletions }, ctx) =>
-      toolResult(async () => service.deleteBills(await userId(principal, store), deletions), ctx, principal, bindingTickets),
+    async ({ billIds }, ctx) =>
+      toolResult(async () => service.deleteBills(await userId(principal, store), billIds), ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1067,12 +1113,13 @@ export function createMoneyTrackMcp(
     {
       description: "创建同币种或跨币种的资产转账或信用卡还款账单",
       inputSchema: createTransferInput,
-      outputSchema: z.object({ bill: billSchema.describe("创建后同步确认的转账或信用卡还款账单") }),
+      outputSchema: billSchema.describe("创建后同步确认的转账或信用卡还款账单"),
       annotations: writeAnnotations,
     },
-    async (input, ctx) => toolResult(async () => ({
-      bill: await service.createTransfer(await userId(principal, store), input),
-    }), ctx, principal, bindingTickets),
+    async ({ time, ...rest }, ctx) => toolResult(async () =>
+      await service.createTransfer(await userId(principal, store),
+        time === undefined ? rest : { ...rest, time: parseIsoTime(time, "time") }),
+    ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1083,12 +1130,14 @@ export function createMoneyTrackMcp(
         billId: positiveIdText.describe("要修改的转账或信用卡还款账单 ID"),
         patch: transferPatchSchema.describe("转账或信用卡还款字段补丁"),
       }),
-      outputSchema: z.object({ bill: billSchema.describe("修改后同步确认的转账或信用卡还款账单") }),
+      outputSchema: billSchema.describe("修改后同步确认的转账或信用卡还款账单"),
       annotations: { ...writeAnnotations, idempotentHint: true },
     },
-    async ({ billId, patch }, ctx) => toolResult(async () => ({
-      bill: await service.updateTransfer(await userId(principal, store), billId, patch),
-    }), ctx, principal, bindingTickets),
+    async ({ billId, patch }, ctx) => toolResult(async () => {
+      const { time, ...rest } = patch;
+      return await service.updateTransfer(await userId(principal, store), billId,
+        time === undefined ? rest : { ...rest, time: parseIsoTime(time, "patch.time") });
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1099,12 +1148,13 @@ export function createMoneyTrackMcp(
         sourceBillId: positiveIdText.describe("退款源账单 ID"),
         ...refundFields,
       }),
-      outputSchema: z.object({ bill: billSchema.describe("钱迹返回并同步确认的退款账单") }),
+      outputSchema: billSchema.describe("钱迹返回并同步确认的退款账单"),
       annotations: writeAnnotations,
     },
-    async (input, ctx) => toolResult(async () => ({
-      bill: await service.createRefund(await userId(principal, store), input),
-    }), ctx, principal, bindingTickets),
+    async ({ time, ...rest }, ctx) => toolResult(async () =>
+      await service.createRefund(await userId(principal, store),
+        time === undefined ? rest : { ...rest, time: parseIsoTime(time, "time") }),
+    ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1115,12 +1165,14 @@ export function createMoneyTrackMcp(
         refundBillId: positiveIdText.describe("要修改的退款账单 ID"),
         patch: refundPatchSchema.describe("退款字段补丁"),
       }),
-      outputSchema: z.object({ bill: billSchema.describe("修改后同步确认的退款账单") }),
+      outputSchema: billSchema.describe("修改后同步确认的退款账单"),
       annotations: { ...writeAnnotations, idempotentHint: true },
     },
-    async ({ refundBillId, patch }, ctx) => toolResult(async () => ({
-      bill: await service.updateRefund(await userId(principal, store), refundBillId, patch),
-    }), ctx, principal, bindingTickets),
+    async ({ refundBillId, patch }, ctx) => toolResult(async () => {
+      const { time, ...rest } = patch;
+      return await service.updateRefund(await userId(principal, store), refundBillId,
+        time === undefined ? rest : { ...rest, time: parseIsoTime(time, "patch.time") });
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1130,14 +1182,11 @@ export function createMoneyTrackMcp(
       inputSchema: z.strictObject({
         refundBillId: positiveIdText.describe("要永久删除的退款账单 ID"),
       }),
-      outputSchema: z.object({
-        deleted: z.literal(true).describe("退款账单已删除"),
-        refundBillId: positiveIdText.describe("已删除的退款账单 ID 十进制字符串"),
-      }),
+      outputSchema: z.object({ deleted: z.literal(true).describe("退款账单已删除") }),
       annotations: destructiveAnnotations,
     },
     async ({ refundBillId }, ctx) =>
-      toolResult(async () => service.deleteRefund(await userId(principal, store), refundBillId), ctx, principal, bindingTickets),
+      toolResult(async () => service.deleteRefund(await userId(principal, store), refundBillId), ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1146,12 +1195,12 @@ export function createMoneyTrackMcp(
       description: "按总金额报销所选待报销支出并返回钱迹生成的关联账单",
       inputSchema: z.strictObject({
         sourceBillIds: z.array(positiveIdText).min(1).max(100)
-          .describe("待报销源账单 ID 列表，内部按 APK 规则分摊总金额"),
+          .describe("待报销源账单 ID 列表，内部按钱迹规则分摊总金额"),
         money: positiveMoneySchema.describe(`本次报销总金额，${sourceBillMoneyDescription}`),
         assetId: optionalAssetIdInputText.optional()
           .describe("报销入账资产 ID，省略或传 null 表示不指定资产"),
-        time: z.number().int().nonnegative().optional()
-          .describe("报销发生时间，Unix 秒，省略时使用服务器当前时间"),
+        time: isoTimeSchema.optional()
+          .describe(`报销发生时间，${inputTimeDescription}，省略时使用服务器当前时间`),
         remark: z.string().max(500).optional().describe("报销备注"),
         tagIds: writeTagIdsSchema.optional().describe("报销关联账单标签 ID 列表"),
         currencyConversion: derivedCurrencyInputSchema.optional()
@@ -1160,11 +1209,12 @@ export function createMoneyTrackMcp(
           "是否允许在钱迹要求时迁移到新版报销",
         ),
       }),
-      outputSchema: z.object({ bills: z.array(billSchema).describe("钱迹返回并同步确认的源账单与报销关联账单") }),
+      outputSchema: z.array(billSchema).describe("钱迹返回并同步确认的源账单与报销关联账单"),
       annotations: writeAnnotations,
     },
-    async (input, ctx) =>
-      toolResult(async () => service.reimburseBills(await userId(principal, store), input), ctx, principal, bindingTickets),
+    async ({ time, ...rest }, ctx) =>
+      toolResult(async () => (await service.reimburseBills(await userId(principal, store),
+        time === undefined ? rest : { ...rest, time: parseIsoTime(time, "time") })).bills, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1174,17 +1224,14 @@ export function createMoneyTrackMcp(
       inputSchema: z.strictObject({
         reimbursementBillId: positiveIdText.describe("要永久删除的报销入账账单 ID"),
       }),
-      outputSchema: z.object({
-        deleted: z.literal(true).describe("报销入账账单已删除"),
-        reimbursementBillId: positiveIdText.describe("已删除的报销入账账单 ID 十进制字符串"),
-      }),
+      outputSchema: z.object({ deleted: z.literal(true).describe("报销入账账单已删除") }),
       annotations: destructiveAnnotations,
     },
     async ({ reimbursementBillId }, ctx) =>
       toolResult(async () => service.deleteReimbursement(
         await userId(principal, store),
         reimbursementBillId,
-      ), ctx, principal, bindingTickets),
+      ), ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1195,14 +1242,11 @@ export function createMoneyTrackMcp(
         sourceBillIds: z.array(positiveIdText).min(1).max(100)
           .describe("待取消报销的源账单 ID 列表"),
       }),
-      outputSchema: z.object({
-        cancelled: z.literal(true).describe("全部指定报销关系已取消"),
-        sourceBillIds: z.array(positiveIdText).describe("已取消报销的源账单 ID 字符串列表"),
-      }),
+      outputSchema: z.object({ cancelled: z.literal(true).describe("全部指定报销关系已取消") }),
       annotations: destructiveAnnotations,
     },
     async ({ sourceBillIds }, ctx) =>
-      toolResult(async () => service.cancelReimbursements(await userId(principal, store), sourceBillIds), ctx, principal, bindingTickets),
+      toolResult(async () => service.cancelReimbursements(await userId(principal, store), sourceBillIds), ctx, principal, bindingTickets, store),
   );
 
   if (principal.role === "admin") registerAdminTools(server, store, principal, bindingTickets);
@@ -1228,12 +1272,12 @@ const destructiveAnnotations = {
   openWorldHint: true,
 } as const;
 
-/** 重新验证请求身份并返回已绑定的账号 ID。 */
+/** 重新验证请求身份并返回已绑定的账号 ID */
 async function userId(principal: AuthenticatedPat, store: DataStore): Promise<number> {
   return (await requireAccountPrincipal(principal, store)).accountId;
 }
 
-/** 注册仅超级管理员可调用的 PAT 管理工具。 */
+/** 注册仅超级管理员可调用的 PAT 管理工具 */
 function registerAdminTools(
   server: McpServer,
   store: DataStore,
@@ -1245,13 +1289,13 @@ function registerAdminTools(
     {
       description: "列出全部超级管理员和普通用户 PAT",
       inputSchema: z.strictObject({}).meta({ required: [] }),
-      outputSchema: z.object({ results: z.array(patMetadataSchema).describe("PAT 元数据列表，不包含 Token") }),
+      outputSchema: z.array(patMetadataSchema).describe("PAT 元数据列表，不包含 Token"),
       annotations: readAnnotations,
     },
     async (_input, ctx) => toolResult(async () => {
       requireAdmin(principal);
-      return { results: (await store.listPats()).map(publicPatMetadata) };
-    }, ctx, principal, bindingTickets),
+      return (await store.listPats()).map(publicPatMetadata);
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1262,8 +1306,8 @@ function registerAdminTools(
         remark: z.string().min(1).max(100).describe("用于识别 PAT 用途或持有人的备注"),
         accountId: z.number().int().positive().nullable().optional()
           .describe("要关联的已有钱迹账号内部标识，null 表示暂不绑定"),
-        expiresAt: z.number().int().positive().nullable().optional()
-          .describe("过期时间，Unix 秒，省略时默认 90 天后，null 表示永不过期"),
+        expiresAt: isoTimeSchema.nullable().optional()
+          .describe(`过期时间，${inputTimeDescription}，省略时默认 90 天后，null 表示永不过期`),
       }),
       outputSchema: z.object({
         pat: createdPatSchema.describe("新创建的 PAT"),
@@ -1274,7 +1318,8 @@ function registerAdminTools(
     async ({ remark, accountId, expiresAt: inputExpiresAt }, ctx) => toolResult(async () => {
       requireAdmin(principal);
       const now = Math.floor(Date.now() / 1000);
-      const expiresAt = inputExpiresAt === undefined ? now + 90 * 24 * 60 * 60 : inputExpiresAt;
+      const expiresAt = inputExpiresAt === undefined ? now + 90 * 24 * 60 * 60
+        : inputExpiresAt === null ? null : parseIsoTime(inputExpiresAt, "expiresAt");
       if (expiresAt !== null && expiresAt <= now) {
         throw new AppError("INVALID_PAT_EXPIRY", "PAT 过期时间必须晚于当前时间");
       }
@@ -1284,7 +1329,7 @@ function registerAdminTools(
         pat: created,
         message: "请将 pat.token 原样填入下方模板的代码块后，只向用户返回填入后的内容，不要省略、改写、重排或补充说明，不要输出本段提示\n\n钱迹 PAT 已生成，请立即保存，完整 PAT 仅显示一次\n\n```\n{pat.token}\n```",
       };
-    }, ctx, principal, bindingTickets),
+    }, ctx, principal, bindingTickets, store),
   );
 
   server.registerTool(
@@ -1294,7 +1339,6 @@ function registerAdminTools(
       inputSchema: z.strictObject({ id: z.number().int().positive().describe("要永久删除的普通用户 PAT 内部标识") }),
       outputSchema: z.object({
         deleted: z.literal(true).describe("PAT 已删除"),
-        id: z.number().int().positive().describe("已删除的 PAT 内部标识"),
         accountDataDeleted: z.boolean().describe("是否因关联账号不再被其他 PAT 使用而删除其全部本地数据"),
       }),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -1303,13 +1347,13 @@ function registerAdminTools(
       requireAdmin(principal);
       const result = await store.deletePat(id);
       if (!result) throw new AppError("PAT_NOT_FOUND", "普通用户 PAT 不存在", 404);
-      return { deleted: true as const, id, accountDataDeleted: result.localDataDeleted };
-    }, ctx, principal, bindingTickets),
+      return { deleted: true as const, accountDataDeleted: result.localDataDeleted };
+    }, ctx, principal, bindingTickets, store),
   );
 }
 
-/** 构造不包含明文令牌的公开 PAT 元数据。 */
-function publicPatMetadata(pat: PatRecord): z.infer<typeof patMetadataSchema> {
+/** 构造不包含明文令牌的公开 PAT 元数据，时间字段按 Unix 秒输出，由工具出口统一渲染 */
+function publicPatMetadata(pat: PatRecord) {
   return {
     id: pat.id,
     accountId: pat.accountId,
@@ -1321,20 +1365,63 @@ function publicPatMetadata(pat: PatRecord): z.infer<typeof patMetadataSchema> {
   };
 }
 
-/** 构造一次性包含明文令牌的 PAT 创建结果。 */
-function publicCreatedPat(pat: PatRecord): z.infer<typeof createdPatSchema> {
+/** 构造一次性包含明文令牌的 PAT 创建结果 */
+function publicCreatedPat(pat: PatRecord) {
   return { ...publicPatMetadata(pat), token: pat.token };
 }
 
-/** 执行业务工具并统一处理结构化结果、连接引导和安全错误。 */
+/** 输出对象中按 Unix 秒传递、出口渲染为 ISO 8601 的受控时间字段名单 */
+const TIME_OUTPUT_FIELDS = new Set([
+  "time",
+  "createTime",
+  "updateTime",
+  "startTime",
+  "endTime",
+  "registeredAt",
+  "vipStart",
+  "vipEnd",
+  "dailyWriteResetsAt",
+  "finishedAt",
+  "nextRepaymentDate",
+  "expiresAt",
+  "createdAt",
+]);
+
+/** 递归把输出中的时间字段从 Unix 秒渲染为用户时区的 ISO 8601 时刻 */
+function renderTimeFields(value: unknown, timeZone: string): void {
+  if (Array.isArray(value)) {
+    for (const item of value) renderTimeFields(item, timeZone);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const record = value as Record<string, unknown>;
+  for (const [key, child] of Object.entries(record)) {
+    if (typeof child === "number" && TIME_OUTPUT_FIELDS.has(key)) {
+      record[key] = formatIsoTime(child, timeZone);
+    } else if (child && typeof child === "object") {
+      renderTimeFields(child, timeZone);
+    }
+  }
+}
+
+/** 读取当前调用方绑定账号的记账时区，未绑定或未设置时使用东八区兜底 */
+async function principalTimeZone(store: DataStore, principal: AuthenticatedPat): Promise<string> {
+  const connection = await store.getPatConnection(principal.patId);
+  if (!connection || connection.accountId === null) return DEFAULT_TIME_ZONE;
+  return (await store.requireAccount(connection.accountId)).timeZone;
+}
+
+/** 执行业务工具并统一处理结构化结果、连接引导和安全错误 */
 async function toolResult<T extends object>(
   action: () => Promise<T>,
   ctx: ServerContext | undefined,
   principal: AuthenticatedPat,
   bindingTickets: BindingTicketManager,
+  store: DataStore,
 ): Promise<CallToolResult | InputRequiredResult> {
   try {
     const output = await action();
+    renderTimeFields(output, await principalTimeZone(store, principal));
     const structured = output as Record<string, unknown>;
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
@@ -1369,7 +1456,7 @@ async function toolResult<T extends object>(
         url: link.url,
       };
       if (!ctx.mcpReq.envelope) {
-        // 部分旧客户端只展示顶层 JSON-RPC 错误，因此同时在消息中携带连接地址。
+        // 部分旧客户端只展示顶层 JSON-RPC 错误，因此同时在消息中携带连接地址
         throw new UrlElicitationRequiredError(
           [{ ...request, mode: "url", elicitationId: randomUUID() }],
           request.message,
@@ -1385,7 +1472,7 @@ async function toolResult<T extends object>(
   }
 }
 
-/** 复用同一 ticket 管理器签发用户可直接打开的一次性连接链接。 */
+/** 复用同一 ticket 管理器签发用户可直接打开的一次性连接链接 */
 function issueConnectionLink(
   principal: AuthenticatedPat,
   bindingTickets: BindingTicketManager,
@@ -1402,7 +1489,7 @@ function issueConnectionLink(
   };
 }
 
-/** 将未知异常转换为不泄露内部信息的 MCP 工具错误。 */
+/** 将未知异常转换为不泄露内部信息的 MCP 工具错误 */
 function errorToolResult(error: unknown): CallToolResult {
   const safe = safeError(error);
   return {
