@@ -305,7 +305,7 @@ test("服务器级说明同时通过新版 discover 和旧版 initialize 返回"
     assert.equal(serverInstructions.includes("`" + toolName + "`"), true, `server instructions must cover ${toolName}`);
   }
   assert.match(serverInstructions, /账本.*list_books.*nameKeyword/);
-  assert.match(serverInstructions, /预算使用情况.*get_budget.*月份起始日.*includeDailyStatistics=true/);
+  assert.match(serverInstructions, /预算使用情况.*get_budget.*月份起始日.*includeDailyStatistics=true/s);
   assert.match(serverInstructions, /批量判断转账方向.*list_bills.*fromId.*targetId.*一次.*list_assets/s);
   assert.match(serverInstructions, /列表字段无歧义.*不要调用.*get_bills.*补充详情.*重复或近似候选.*关系冲突.*摘要缺失字段.*完整记录.*一次批量读取.*写入成功后.*完整账单/s);
   assert.doesNotMatch(serverInstructions, /写入后验证/);
@@ -441,7 +441,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.match(String(schemaNode(tools.find(({ name }) => name === "list_bills")?.inputSchema, "remarkKeyword").description), /匹配账单备注.*不区分大小写.*字面子串/);
   const listBillsTool = tools.find(({ name }) => name === "list_bills")!;
   const getBillTool = tools.find(({ name }) => name === "get_bills")!;
-  assert.equal(listBillsTool.description, "分页查询当前钱迹账号的账单摘要");
+  assert.equal(listBillsTool.description, "分页查询当前钱迹账号的账单摘要，筛选互斥：type 与 types、categoryId 与 categoryIds、tagId 与 tagIds、assetId 与 assetIds 每对不能同时传入，noAsset 不能与资产 ID 筛选同时使用，noTags 不能与标签 ID 筛选同时使用，使用 cursor 时不能传其他筛选或分页参数");
   assert.equal(getBillTool.description, "按账单 ID 列表批量返回完整账单，只返回存在的账单，缺失的 ID 不会出现在结果中，调用方需自行比对请求与返回的 ID，重复 ID 去重");
   assert.equal(schemaNode(getBillTool.inputSchema, "billIds").minItems, 1);
   assert.equal(schemaNode(getBillTool.inputSchema, "billIds").maxItems, 100);
@@ -484,7 +484,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   const updateBillsTool = tools.find(({ name }) => name === "update_bills")!;
   const updateBillPatch = schemaNode(updateBillsTool.inputSchema, "updates", "items", "patch");
   assert.equal("type" in (updateBillPatch.properties as Record<string, unknown>), false);
-  assert.equal(updateBillsTool.description, "批量修改普通支出、收入或待报销支出账单");
+  assert.equal(updateBillsTool.description, "批量修改普通支出、收入或待报销支出账单，不支持收入与支出类型互改，需要变更类型时删除后重建");
   const tagStatus = schemaNode(tools.find(({ name }) => name === "list_tags")?.inputSchema, "status");
   assert.equal(tagStatus.default, 1);
   assert.equal(String(tagStatus.description), "标签状态范围");
@@ -562,7 +562,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.match(String(schemaNode(billSummary, "fromId").description), /来源关联资产 ID.*上游未返回.*省略/);
   assert.match(String(schemaNode(billSummary, "targetId").description), /目标关联资产 ID.*上游未返回.*省略/);
   assert.equal(tools.find(({ name }) => name === "create_bills")?.description, "批量创建普通支出、收入或待报销支出账单");
-  assert.equal(tools.find(({ name }) => name === "update_bills")?.description, "批量修改普通支出、收入或待报销支出账单");
+  assert.equal(tools.find(({ name }) => name === "update_bills")?.description, "批量修改普通支出、收入或待报销支出账单，不支持收入与支出类型互改，需要变更类型时删除后重建");
   assert.equal(tools.find(({ name }) => name === "delete_bills")?.description, "批量永久删除普通收支、待报销支出、转账或信用卡还款账单，并自动连带删除其退款和报销关联子账单");
   assert.equal(tools.find(({ name }) => name === "list_debt_accounts")?.description, "独立查询当前钱迹账号的借入或借出详情");
   const debtItem = schemaNode(tools.find(({ name }) => name === "list_debt_accounts")?.outputSchema, "items");
@@ -734,7 +734,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     "是否将本次操作记为信用卡还款",
   );
   const updateTransferTool = tools.find(({ name }) => name === "update_transfer")!;
-  assert.equal(updateTransferTool.description, "修改资产转账或信用卡还款账单");
+  assert.equal(updateTransferTool.description, "修改资产转账或信用卡还款账单，转出与转入资产必须不同，信用卡还款场景下转入资产必须是信用账户，债务或借贷资产不能作为转出或转入资产");
   assert.equal(String(schemaNode(updateTransferTool.inputSchema, "patch", "targetAssetId").description), "新的转入资产 ID");
   assert.equal(String(schemaNode(updateTransferTool.inputSchema, "patch", "creditRepayment").description), "新的信用卡还款标记");
   for (const [toolName, path] of [
@@ -1616,11 +1616,11 @@ test("超级管理员 PAT 取得 26 个业务工具和 3 个 PAT 管理工具", 
   }
   assert.deepEqual((createPatAccountId.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["integer", "null"]);
   assert.deepEqual((createPatExpiresAt.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["null", "string"]);
-  assert.equal(createPatTool.description, "创建可选关联已有钱迹账号的普通用户 PAT");
+  assert.equal(createPatTool.description, "创建可选关联已有钱迹账号的普通用户 PAT，完整 PAT 仅在创建响应中返回一次，此后不可再查");
   assert.equal(String(schemaNode(createPatTool.outputSchema, "pat", "token").description), "新创建且仅本次返回的完整明文 PAT");
   assert.equal(String(schemaNode(createPatTool.outputSchema, "message").description), "新 PAT 的用户交付模板");
   assert.equal(deletePatTool.annotations?.destructiveHint, true);
-  assert.equal(deletePatTool.description, "永久删除普通用户 PAT，并在关联账号不再被其他 PAT 使用时删除其本地数据");
+  assert.equal(deletePatTool.description, "永久删除普通用户 PAT，并在关联账号不再被其他 PAT 使用时删除其本地数据，传入超级管理员 PAT 的 id 时视为不存在");
   const booksResult = await client.callTool({ name: "list_books", arguments: {} });
   assert.deepEqual(booksResult.structuredContent, []);
   const createdResult = await client.callTool({

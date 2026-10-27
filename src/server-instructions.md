@@ -16,20 +16,32 @@
 - 标签：使用 `list_tags`
 - 账单批量盘点、查重或只读对账：使用 `list_bills`，`remarkKeyword` 按不区分大小写的字面子串匹配，需要完整筛选范围时继续翻页到 `nextCursor=null`
 - 共享账本按成员筛选：先使用 `list_book_members` 取得成员 ID，再传给 `list_bills.memberIds` 或 `get_bill_statistics.memberIds`
-- 收支、报销、退款、分类、成员或时间趋势统计：使用 `get_bill_statistics`，`currency` 币种标识同时筛选原始记账币种并指定统计结果币种，省略时不筛选原始币种并按当前本位币汇总
+- 收支、报销、退款、分类、成员或时间趋势统计：使用 `get_bill_statistics`
+  - `currency` 币种标识同时筛选原始记账币种并指定统计结果币种，省略时不筛选原始币种并按当前本位币汇总
   - 无论是否传入 `currency`，都直接使用固定返回结构，不自行发明 `groupBy`
-- 预算使用情况：使用 `get_budget`，省略 `period` 时查询按账本月份起始日确定的当前月，只有用户需要逐日支出、累计支出或预算趋势时才设 `includeDailyStatistics=true`
+- 预算使用情况：使用 `get_budget`
+  - 省略 `period` 时查询按账本月份起始日确定的当前月
+  - 只有用户需要逐日支出、累计支出或预算趋势时才设 `includeDailyStatistics=true`
 - 批量判断转账方向：直接使用 `list_bills` 摘要的 `fromId`/`targetId`，需要显示资产名称时只调用一次 `list_assets` 建立 ID 映射
-- 列表字段无歧义时直接使用结果，不要调用 `get_bills` 补充详情，只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才按 ID 一次批量读取，写入成功后直接使用写入工具返回的完整账单
+- 列表字段无歧义时直接使用结果，不要调用 `get_bills` 补充详情
+  - 只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才按 ID 一次批量读取
+  - 写入成功后直接使用写入工具返回的完整账单
 
 #### 创建或修改
 
-需要账本、资产、分类或标签 ID 且当前缺少可信 ID 时，只调用对应的 `list_books`、`list_assets`、`list_categories` 或 `list_tags` 获取，不得猜测或构造 ID。
+需要账本、资产、分类或标签 ID 且当前缺少可信 ID 时，只调用对应的 `list_books`、`list_assets`、`list_categories` 或 `list_tags` 获取。
+不得猜测或构造 ID。
 
-- 普通收支：创建使用 `create_bills` 的 `bills`，修改使用 `update_bills` 的 `updates`，即使只操作一笔，也传入只有一项的列表，修改按 `billId` 定位原账单，不传 `type`，只在用户要求时通过 `reimbursable` 切换普通支出与待报销支出
-- 转账或信用卡还款：创建使用 `create_transfer`，修改使用 `update_transfer`，修改按 `billId` 定位单笔账单，只在用户要求改变场景时传 `creditRepayment`，同一次修改可以同时提交最终场景、金额和双边资产
+- 普通收支：创建使用 `create_bills` 的 `bills`，修改使用 `update_bills` 的 `updates`
+  - 即使只操作一笔，也传入只有一项的列表
+  - 修改按 `billId` 定位原账单，不传 `type`
+  - 只在用户要求时通过 `reimbursable` 切换普通支出与待报销支出
+- 转账或信用卡还款：创建使用 `create_transfer`，修改使用 `update_transfer`
+  - 修改按 `billId` 定位单笔账单，只在用户要求改变场景时传 `creditRepayment`
+  - 同一次修改可以同时提交最终场景、金额和双边资产
 - 退款：创建使用 `create_refund`，修改使用 `update_refund`，修改按 `refundBillId` 定位单笔退款，不传源账单 ID
-- 报销：创建使用 `reimburse_bills`，只传源账单列表和本次总金额，单条报销入账删除使用 `delete_reimbursement`，按源账单取消全部报销关系使用 `cancel_reimbursements`
+- 报销：创建使用 `reimburse_bills`，只传源账单列表和本次总金额
+  - 单条报销入账删除使用 `delete_reimbursement`，按源账单取消全部报销关系使用 `cancel_reimbursements`
   1. 收到迁移新版报销提示时，告知用户迁移后旧版本将不能继续使用报销
   2. 取得明确同意后，用相同业务参数将 `confirmReimbursementUpgrade` 设为 `true` 重试
   3. 不得预先同意，仅可重试一次
@@ -46,19 +58,29 @@
 - 一笔或多笔普通收支、待报销支出、转账或还款：使用 `delete_bills` 的 `billIds`，存在退款或报销关联账单时自动连带删除
 - 单笔退款：使用 `delete_refund` 的 `refundBillId`
 - 单笔报销入账：使用 `delete_reimbursement` 的 `reimbursementBillId`
-- 取消一笔或多笔源账单的全部报销关系：使用 `cancel_reimbursements` 的 `sourceBillIds`，保留源账单并删除其报销入账子账单，不得传报销入账子账单 ID
+- 取消一笔或多笔源账单的全部报销关系：使用 `cancel_reimbursements` 的 `sourceBillIds`
+  - 保留源账单并删除其报销入账子账单，不得传报销入账子账单 ID
 - 当前 PAT 的钱迹账号绑定：使用 `disconnect_qianji`，调用前告知用户会删除本地数据且不影响钱迹云端数据
 
 完成当前用户请求所需的全部调用后，将最终结果交付用户并结束本次操作。
 
 ### 异常恢复
 
+工具入参校验失败以 JSON-RPC 错误返回，消息以 `Input validation error` 开头且不含错误码，按提示修正参数后重试。工具执行失败返回 `isError=true`，正文为 JSON `{error: {code, message}}`，错误码按以下分类处理：
+
+- 参数或业务约束违反类（`INVALID_*`、`*_MISMATCH`、`*_REQUIRED` 等）：按 message 修正输入或状态后重试
+- 状态恢复类：按本节各条策略或 message 提示处理
+- 连接引导类：按本节首条账号连接条目处理
+
+各工具的约束触发条件以其工具说明为准，错误码以实际返回的 `error.code` 为准，分类未覆盖的错误码按 message 处理。
+
 - PAT 未绑定钱迹账号或钱迹登录状态失效时：
   1. 将客户端返回的 10 分钟一次性连接链接原样交给用户，并提醒在 10 分钟内登录
   2. 先提供可点击的 Markdown 链接，再在下一段附上未省略、未转义的完整原始 URL，不得只提供其中一种
   3. 首次连接填写钱迹账号和密码，未解绑的重新登录只填写密码，完成连接后重试原操作
   4. 除上述两种完整链接形式外，不得索取、提取或复述账号、密码、PAT 或链接中的一次性 `ticket`
-- 需要确认钱迹最新状态时，调用 `refresh_cache` 刷新用户、账单及全部目录缓存，包含币种目录；收到 `WRITE_CONFIRMATION_FAILED` 时，刷新后查询相关账单，仍无法确认时停止并告知用户，不得自动重试原写入
+- 需要确认钱迹最新状态时，调用 `refresh_cache` 刷新用户、账单及全部目录缓存，包含币种目录
+- 收到 `WRITE_CONFIRMATION_FAILED` 时，刷新后查询相关账单，仍无法确认时停止并告知用户，不得自动重试原写入
 - 批量写入收到 `WRITE_PARTIAL` 时，只处理错误中标记为冲突或未确认的项，不得重试成功项
 
 ### 数据约定
