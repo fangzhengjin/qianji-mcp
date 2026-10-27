@@ -144,7 +144,6 @@ export interface GetBudgetInput {
 const DISPLAY_FIELDS = ["category", "fromact", "targetact", "paytype", "bookname"];
 const GLOBAL_SYNC_BOOK_ID = "-1";
 const USER_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
-const DAILY_WRITE_LIMIT = 15;
 const KNOWN_BILL_TYPES = new Set([0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 20, 21, 22]);
 const MAX_SYNC_PAGES = 200;
 const BILL_SCAN_LIMIT = 1_000_000_000;
@@ -236,10 +235,10 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回最小用户资料、缓存期内的 VIP 状态和当天共享写入配额 */
+  /** 返回最小用户资料和缓存期内的 VIP 状态 */
   async getUserInfo(accountId: number): Promise<Record<string, unknown>> {
     return this.withAccount(accountId, async (account) =>
-      publicUser(await this.loadUserWithCurrencyConfig(account), this.store, account.id, this.now(), account.timeZone),
+      publicUser(await this.loadUserWithCurrencyConfig(account), this.now(), account.timeZone),
     );
   }
 
@@ -623,7 +622,7 @@ export class MoneyTrackService {
     if (inputs.length === 0) throw new AppError("INVALID_BILLS", "bills 不能为空");
     return this.withBillAccount(accountId, async (account) => {
       const maxTagCount = Math.max(0, ...inputs.map((input) => input.tagIds?.length ?? 0));
-      return this.withBusinessWrite(account, Array(maxTagCount).fill(""), async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, Array(maxTagCount).fill(""), async () => {
         const now = Math.floor(this.now() / 1000);
         const bills: Record<string, unknown>[] = [];
         const billIds = new Set<string>();
@@ -683,7 +682,7 @@ export class MoneyTrackService {
           });
         }
         const result = await this.client.syncBills(account, { bills: { changelist: bills } });
-        await this.acceptSyncBillResult(account, result, bills.map(({ id }) => String(id)), markRemoteSuccess);
+        await this.acceptSyncBillResult(account, result, bills.map(({ id }) => String(id)));
         await this.confirmWrite(() => this.syncUnlocked(account));
         const confirmed = await Promise.all(bills.map((bill) => this.store.getBill(account.id, String(bill.id))));
         if (confirmed.some((row) => !row)) throw writeConfirmationFailed("批量创建后同步未确认全部账单");
@@ -820,9 +819,9 @@ export class MoneyTrackService {
         prepared.push({ id, patch, raw, previousRaw, adjustment, expectedFlag, expectedStoredMoney, expectedCurrency, currencyChanged, tagIds });
       }
       const maxTagCount = Math.max(0, ...prepared.map(({ tagIds }) => tagIds.length));
-      return this.withBusinessWrite(account, Array(maxTagCount).fill(""), async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, Array(maxTagCount).fill(""), async () => {
         const result = await this.client.syncBills(account, { bills: { changelist: prepared.map(({ raw }) => raw) } });
-        await this.acceptSyncBillResult(account, result, prepared.map(({ id }) => id), markRemoteSuccess);
+        await this.acceptSyncBillResult(account, result, prepared.map(({ id }) => id));
         await this.confirmWrite(() => this.syncUnlocked(account));
         const results: Record<string, unknown>[] = [];
         for (const item of prepared) {
@@ -869,10 +868,10 @@ export class MoneyTrackService {
         expanded.add(id);
         for (const relatedId of relatedBillIds) expanded.add(relatedId);
       }
-      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, [], async () => {
         const expandedIds = [...expanded];
         const result = await this.client.syncBills(account, { bills: { dellist: expandedIds } });
-        await this.acceptSyncBillResult(account, result, expandedIds, markRemoteSuccess);
+        await this.acceptSyncBillResult(account, result, expandedIds);
         await this.confirmWrite(() => this.syncUnlocked(account));
         const remaining = await Promise.all([...expanded].map((candidate) =>
           this.store.getBill(account.id, candidate)
@@ -900,7 +899,7 @@ export class MoneyTrackService {
         : normalizeAssetId(input.assetId);
       const previousRefundIds = new Set(refundRelationshipMap(before).keys());
 
-      return this.withBusinessWrite(account, tagIds, async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, tagIds, async () => {
         validateRefundSource(before, true);
         await this.validateAssetAndTags(account, assetId, tagIds);
         const payload = refundPayload(
@@ -926,7 +925,6 @@ export class MoneyTrackService {
           tagIds,
         };
         const returned = await this.client.refundBill(account, sourceId, payload);
-        markRemoteSuccess();
         await this.confirmWrite(() => this.saveConfirmedBillsAndSync(account, returned));
         const confirmedSource = await this.store.getBill(account.id, sourceId);
         if (!confirmedSource) throw writeConfirmationFailed("退款后同步未确认源账单");
@@ -978,7 +976,7 @@ export class MoneyTrackService {
       const tagIds = patch.tagIds ?? tagIdsFrom(refund);
       requirePositiveMoney(money, "退款金额");
 
-      return this.withBusinessWrite(account, tagIds, async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, tagIds, async () => {
         validateRefundSource(source, false);
         await this.validateAssetAndTags(account, assetId, tagIds);
         const input: CreateRefundInput = {
@@ -1017,7 +1015,6 @@ export class MoneyTrackService {
           expectedCurrency = publicCurrencyConversion(refund);
         }
         const returned = await this.client.refundBill(account, sourceId, payload);
-        markRemoteSuccess();
         await this.confirmWrite(() => this.saveConfirmedBillsAndSync(account, returned));
         const confirmed = await this.store.getBill(account.id, refundId);
         const confirmedRaw = confirmed && cachedBillObject(confirmed);
@@ -1075,9 +1072,9 @@ export class MoneyTrackService {
         : reimbursementRelationshipMap(sourceRaw);
       const expectedRelationships = new Map(previousRelationships);
       expectedRelationships.delete(relatedId);
-      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, [], async () => {
         const result = await this.client.syncBills(account, { bills: { dellist: [relatedId] } });
-        await this.acceptSyncBillResult(account, result, [relatedId], markRemoteSuccess);
+        await this.acceptSyncBillResult(account, result, [relatedId]);
         await this.confirmWrite(() => this.syncUnlocked(account));
         const [source, remainingRelated] = await Promise.all([
           this.store.getBill(account.id, sourceId),
@@ -1137,7 +1134,7 @@ export class MoneyTrackService {
         throw new AppError("SOURCE_CURRENCY_UNAVAILABLE", "无法从报销源账单取得来源币种");
       }
 
-      return this.withBusinessWrite(account, tagIds, async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, tagIds, async () => {
         await this.validateAssetAndTags(account, assetId, tagIds);
         const targetCurrency = await this.assetCurrency(account, assetId);
         const sourceCurrency = [...sourceCurrencies][0]!;
@@ -1234,7 +1231,6 @@ export class MoneyTrackService {
             );
           }
         }
-        markRemoteSuccess();
         await this.confirmWrite(() => this.saveConfirmedBillsAndSync(account, returned.bills));
         const affected = new Set(ids);
         for (const id of ids) {
@@ -1287,9 +1283,8 @@ export class MoneyTrackService {
         if (related.length === 0) throw new AppError("REIMBURSEMENT_NOT_FOUND", "源账单没有可取消的报销关系");
         for (const child of related) children.add(child);
       }
-      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, [], async () => {
         await this.client.cancelReimbursement(account, ids);
-        markRemoteSuccess();
         await this.confirmWrite(() => this.syncUnlocked(account));
         for (const id of ids) {
           const row = await this.store.getBill(account.id, id);
@@ -1321,7 +1316,7 @@ export class MoneyTrackService {
       const money = storedBillMoney(input.money, adjustment);
       const flag = resolveBillFlag(0, input);
       const type = input.creditRepayment ? 3 : 2;
-      return this.withBusinessWrite(account, tagIds, async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, tagIds, async () => {
         const { from, target } = await this.validateTransferReferences(
           account,
           bookId,
@@ -1367,7 +1362,7 @@ export class MoneyTrackService {
           extra,
         };
         const result = await this.client.syncBills(account, { bills: { changelist: [raw] } });
-        await this.acceptSyncBillResult(account, result, [raw.id], markRemoteSuccess);
+        await this.acceptSyncBillResult(account, result, [raw.id]);
         await this.confirmWrite(() => this.syncUnlocked(account));
         const confirmed = await this.store.getBill(account.id, raw.id);
         if (!confirmed) throw writeConfirmationFailed("转账或还款创建后同步未确认账单");
@@ -1439,7 +1434,7 @@ export class MoneyTrackService {
       raw.status = 2;
       for (const field of DISPLAY_FIELDS) delete raw[field];
       const tagIds = tagIdsFrom(raw);
-      return this.withBusinessWrite(account, tagIds, async (markRemoteSuccess) => {
+      return this.withBusinessWrite(account, tagIds, async () => {
         const { from, target } = await this.validateTransferReferences(
           account,
           bookId,
@@ -1489,7 +1484,7 @@ export class MoneyTrackService {
           ? currencyExtraToPublic(nextCurrencyExtra)
           : publicCurrencyConversion(raw);
         const result = await this.client.syncBills(account, { bills: { changelist: [raw] } });
-        await this.acceptSyncBillResult(account, result, [id], markRemoteSuccess);
+        await this.acceptSyncBillResult(account, result, [id]);
         await this.confirmWrite(() => this.syncUnlocked(account));
         const confirmed = await this.store.getBill(account.id, id);
         const confirmedRaw = confirmed && cachedBillObject(confirmed);
@@ -1514,29 +1509,18 @@ export class MoneyTrackService {
     });
   }
 
-  /** 统一执行标签上限、非 VIP 配额预占及远端成功后的配额保留 */
+  /** 统一执行按 VIP 状态区分的标签上限校验 */
   private async withBusinessWrite<T>(
     account: QianjiAccount,
     tagIds: string[],
-    operation: (markRemoteSuccess: () => void) => Promise<T>,
+    operation: () => Promise<T>,
   ): Promise<T> {
     const vip = isVip(await this.loadUser(account, false, false), this.now());
     const tagLimit = vip ? 8 : 1;
     if (tagIds.length > tagLimit) {
       throw new AppError("TAG_LIMIT_EXCEEDED", `${vip ? "VIP" : "非 VIP"} 每次写入最多使用 ${tagLimit} 个标签`);
     }
-    if (vip) return operation(() => {});
-
-    const date = zoneDateKey(Math.floor(this.now() / 1000), account.timeZone);
-    await this.store.reserveWriteQuota(account.id, date, DAILY_WRITE_LIMIT);
-    // 配额统计钱迹已接受的写入，因此本地确认失败时也不能释放名额
-    // ponytail: 接受前崩溃最多占用一个名额到账号时区的午夜，实际发生后再引入持久化写入日志
-    let remoteSucceeded = false;
-    try {
-      return await operation(() => { remoteSucceeded = true; });
-    } finally {
-      if (!remoteSucceeded) await this.store.releaseWriteQuota(account.id, date);
-    }
+    return operation();
   }
 
   /** 在唯一入口处保留部分成功配额、刷新本地状态并返回逐项结果 */
@@ -1544,10 +1528,8 @@ export class MoneyTrackService {
     account: QianjiAccount,
     result: SyncBillResult,
     expectedIds: string[],
-    markRemoteSuccess: () => void,
   ): Promise<void> {
     const inspected = inspectWriteResult(result, expectedIds);
-    if (inspected.appliedIds.length > 0) markRemoteSuccess();
     if (!inspected.error) return;
     if (inspected.appliedIds.length > 0) {
       try {
@@ -2146,14 +2128,12 @@ export class MoneyTrackService {
   }
 }
 
-/** 构造公开用户资料，并为非 VIP 用户附加当天写入配额 */
-async function publicUser(
+/** 构造公开用户资料 */
+function publicUser(
   user: Record<string, unknown>,
-  store: DataStore,
-  accountId: number,
   nowMs: number,
   timeZone: string,
-): Promise<Record<string, unknown>> {
+): Record<string, unknown> {
   const vip = isVip(user, nowMs);
   const result: Record<string, unknown> = {
     id: String(user.id),
@@ -2169,18 +2149,7 @@ async function publicUser(
   };
   const registrationMethod = registrationMethodName(Number(user.platform ?? 0));
   if (registrationMethod) result.registrationMethod = registrationMethod;
-  if (vip) return result;
-  const quota = await store.getWriteQuota(accountId);
-  const today = zoneDateKey(Math.floor(nowMs / 1000), timeZone);
-  const used = quota.date === today ? quota.used : 0;
-  const { year, month, day } = zoneCalendarParts(Math.floor(nowMs / 1000), timeZone);
-  return {
-    ...result,
-    dailyWriteLimit: DAILY_WRITE_LIMIT,
-    dailyWriteUsed: used,
-    dailyWriteRemaining: Math.max(0, DAILY_WRITE_LIMIT - used),
-    dailyWriteResetsAt: zoneDayEpoch(year, month, day + 1, timeZone),
-  };
+  return result;
 }
 
 function publicVipTime(value: unknown, label: string): number | null {

@@ -24,7 +24,7 @@ export interface QianjiAccount {
   uid: string;
   utoken: string;
   devid: string;
-  /** 账号当前记账时区（IANA 名称），决定统计分桶、预算期间、写入额度和渲染口径，由存储层读取时兜底为东八区 */
+  /** 账号当前记账时区（IANA 名称），决定统计分桶、预算期间和渲染口径，由存储层读取时兜底为东八区 */
   timeZone: string;
 }
 
@@ -78,11 +78,6 @@ export interface CatalogCache {
 export interface UserCache {
   data: Record<string, unknown>;
   refreshedAtMs: number;
-}
-
-export interface WriteQuota {
-  date: string | null;
-  used: number;
 }
 
 export interface BillFilters {
@@ -152,12 +147,6 @@ export interface DataStore {
   getUserCache(accountId: number): MaybePromise<UserCache | undefined>;
   /** 写入用户资料缓存 */
   setUserCache(accountId: number, user: Record<string, unknown>, refreshedAtMs?: number): MaybePromise<void>;
-  /** 读取账号当天的写入配额 */
-  getWriteQuota(accountId: number): MaybePromise<WriteQuota>;
-  /** 原子预占一个写入名额 */
-  reserveWriteQuota(accountId: number, date: string, limit: number): MaybePromise<WriteQuota>;
-  /** 释放未形成远端写入的预占名额 */
-  releaseWriteQuota(accountId: number, date: string): MaybePromise<void>;
   /** 统计账号的本地账单数量 */
   countBills(accountId: number): MaybePromise<number>;
   /** 读取最后提交的全局同步游标 */
@@ -405,47 +394,6 @@ export class Store implements DataStore {
       .run(JSON.stringify(user), refreshedAtMs, accountId);
   }
 
-  /** 读取钱迹账号 UID 共用的持久化每日写入配额 */
-  getWriteQuota(accountId: number): WriteQuota {
-    const row = this.db
-      .prepare("SELECT write_quota_date, write_quota_used FROM accounts WHERE id = ?")
-      .get(accountId) as SqlRow | undefined;
-    if (!row) throw new AppError("QIANJI_ACCOUNT_NOT_BOUND", "尚未绑定钱迹账号");
-    return {
-      date: row.write_quota_date === null ? null : String(row.write_quota_date),
-      used: Number(row.write_quota_used),
-    };
-  }
-
-  /** 原子预占一个非 VIP 写入名额，并在自然日变化时重置旧计数 */
-  reserveWriteQuota(accountId: number, date: string, limit: number): WriteQuota {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const current = this.getWriteQuota(accountId);
-      const used = current.date === date ? current.used : 0;
-      if (used >= limit) {
-        throw new AppError("DAILY_WRITE_LIMIT_REACHED", `今日成功业务写入已达到 ${limit} 次上限`);
-      }
-      const next = used + 1;
-      this.db.prepare("UPDATE accounts SET write_quota_date = ?, write_quota_used = ? WHERE id = ?")
-        .run(date, next, accountId);
-      this.db.exec("COMMIT");
-      return { date, used: next };
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  /** 在上游未接受写入时释放预占名额 */
-  releaseWriteQuota(accountId: number, date: string): void {
-    this.db.prepare(`
-      UPDATE accounts
-      SET write_quota_used = write_quota_used - 1
-      WHERE id = ? AND write_quota_date = ? AND write_quota_used > 0
-    `).run(accountId, date);
-  }
-
   /** 统计一个账号的全部本地缓存账单 */
   countBills(accountId: number): number {
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM bills WHERE account_id = ?").get(accountId) as SqlRow;
@@ -648,7 +596,7 @@ export class Store implements DataStore {
     return Boolean(this.db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(accountId));
   }
 
-  /** 为早于用户缓存功能创建的数据库补充缓存和配额列 */
+  /** 为早于用户缓存功能创建的数据库补充缓存、登录标识和时区列 */
   private migrateAccountCache(): void {
     const columns = new Set(
       (this.db.prepare("PRAGMA table_info(accounts)").all() as SqlRow[]).map(({ name }) => String(name)),
@@ -656,8 +604,6 @@ export class Store implements DataStore {
     const missing = [
       ["user_json", "TEXT"],
       ["user_refreshed_at_ms", "INTEGER"],
-      ["write_quota_date", "TEXT"],
-      ["write_quota_used", "INTEGER NOT NULL DEFAULT 0 CHECK (write_quota_used >= 0)"],
       ["login_identifier", "TEXT"],
       ["timezone", "TEXT"],
     ].filter(([name]) => !columns.has(name!));

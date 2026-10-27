@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "bun:test";
 
-import { AppError } from "../src/errors.ts";
 import { ServerStore } from "../src/server-store.ts";
 
 const urls = [process.env.QIANJI_TEST_POSTGRES_URL, process.env.QIANJI_TEST_MYSQL_URL].filter(Boolean) as string[];
@@ -68,7 +67,7 @@ test("服务端 v2 目录约束可迁移到 v3", async () => {
   assert.equal(statements.includes("INSERT INTO qianji_schema_versions(version, applied_at) VALUES (?, ?)"), true);
 });
 
-test.skipIf(urls.length === 0)("PostgreSQL 和 MySQL 保持存储、事务、标签及额度契约", async () => {
+test.skipIf(urls.length === 0)("PostgreSQL 和 MySQL 保持存储、事务及标签契约", async () => {
   for (const value of urls) {
     const store = new ServerStore(new URL(value));
     try {
@@ -100,12 +99,6 @@ test.skipIf(urls.length === 0)("PostgreSQL 和 MySQL 保持存储、事务、标
       assert.equal((await store.listBills(account.id, { tagId: "abc", limit: 20 }))[0]?.id, "9223372036854775806");
       assert.equal((await store.listBills(account.id, { createStartTime: 10, remarkKeyword: "numeric", assetId: "9223372036854775804", fromAssetId: "3", targetAssetId: "4", limit: 20 }))[0]?.id, "9223372036854775807");
       assert.equal((await store.listBills(account.id, { remarkKeyword: "NUMERIC", limit: 20 })).length, 1);
-
-      const quota = await Promise.allSettled(Array.from({ length: 6 }, () => store.reserveWriteQuota(account.id, "2026-08-12", 5)));
-      assert.equal(quota.filter(({ status }) => status === "fulfilled").length, 5);
-      assert.equal(quota.filter(({ status }) => status === "rejected").length, 1);
-      const rejected = quota.find(({ status }) => status === "rejected");
-      assert.equal(rejected?.status === "rejected" && rejected.reason instanceof AppError, true);
 
       await assert.rejects(() => store.applySyncBatch(account.id, {
         changes: [{ id: "not-an-id", bookid: "-1", time: 11, type: 0, money: 1, cateid: -1, assetid: -1 }],

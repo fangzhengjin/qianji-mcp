@@ -9,9 +9,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   user_json TEXT,
-  user_refreshed_at_ms INTEGER,
-  write_quota_date TEXT,
-  write_quota_used INTEGER NOT NULL DEFAULT 0 CHECK (write_quota_used >= 0)
+  user_refreshed_at_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS pats (

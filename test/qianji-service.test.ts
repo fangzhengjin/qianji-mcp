@@ -1031,16 +1031,14 @@ test("用户信息按 4 小时缓存并实时计算 VIP 起止边界", async (t)
   assert.equal("phone" in active, false);
   assert.equal(initCalls, 0);
 
-  store.db.prepare("UPDATE accounts SET write_quota_date = ?, write_quota_used = 4 WHERE id = ?")
-    .run("2099-01-01", account.id);
   now = vipEnd * 1000;
   const expired = await service.getUserInfo(accountId);
   assert.equal(expired.isVip, false);
   assert.equal(expired.vipType, "年VIP");
-  assert.equal(expired.dailyWriteLimit, 15);
-  assert.equal(expired.dailyWriteUsed, 0);
-  assert.equal(expired.dailyWriteRemaining, 15);
-  assert.equal(typeof expired.dailyWriteResetsAt, "number");
+  assert.equal("dailyWriteLimit" in expired, false);
+  assert.equal("dailyWriteUsed" in expired, false);
+  assert.equal("dailyWriteRemaining" in expired, false);
+  assert.equal("dailyWriteResetsAt" in expired, false);
   assert.equal(initCalls, 0);
 
   now = (vipStart + 4 * 60 * 60) * 1000;
@@ -1083,7 +1081,7 @@ test("旧用户缓存缺少币种配置时只强制初始化一次", async (t) =
   assert.equal(initCalls, 1);
 });
 
-test("VIP 与非 VIP 在共享写边界使用不同标签上限，VIP 不更新额度", async (t) => {
+test("VIP 与非 VIP 在写边界使用不同标签上限", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = 1_770_000_000_000;
@@ -1109,8 +1107,6 @@ test("VIP 与非 VIP 在共享写边界使用不同标签上限，VIP 不更新�
     vipstart: Math.floor(now / 1000) - 1,
     vipend: Math.floor(now / 1000) + 3600,
   }, now);
-  store.db.prepare("UPDATE accounts SET write_quota_date = '2026-02-02', write_quota_used = 5 WHERE id = ?")
-    .run(account.id);
   const created = await createOneBill(service, accountId, {
     bookId: "1",
     type: 0,
@@ -1119,7 +1115,6 @@ test("VIP 与非 VIP 在共享写边界使用不同标签上限，VIP 不更新�
     tagIds: tagIds.slice(0, 8),
   });
   assert.deepEqual(created.tagIds, tagIds.slice(0, 8));
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-02-02", used: 5 });
   await assert.rejects(
     createOneBill(service, accountId, {
       bookId: "1",
@@ -1132,40 +1127,31 @@ test("VIP 与非 VIP 在共享写边界使用不同标签上限，VIP 不更新�
   );
 });
 
-test("非 VIP 额度按 UID 共享，未来日期重置且并发第 15/16 次结果确定", async (t) => {
+test("同 UID 两枚 PAT 并发写入不受每日次数限制", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const secondPat = store.createPat("同 UID 第二枚 PAT", null);
   const sharedAccount = store.bindPat(secondPat.id, account.uid, "token-2", "device-2");
   assert.equal(sharedAccount.id, account.id);
   const now = Date.UTC(2026, 7, 12, 4);
-  const today = "2026-08-12";
   const upstream = createStatefulUpstream();
   const service = new MoneyTrackService(store, new QianjiClient({ fetch: upstream.fetch }), () => now);
   cacheWriteContext(store, account, { id: account.uid, viptype: -1, vipstart: 0, vipend: 0 }, ["tag-1"], now);
 
-  store.db.prepare("UPDATE accounts SET write_quota_date = '2099-01-01', write_quota_used = 5 WHERE id = ?")
-    .run(account.id);
-  await createOneBill(service, accountId, { bookId: "1", type: 0, money: 1, categoryId: "2" });
-  assert.deepEqual(store.getWriteQuota(account.id), { date: today, used: 1 });
-
-  store.db.prepare("UPDATE accounts SET write_quota_date = ?, write_quota_used = 14 WHERE id = ?")
-    .run(today, account.id);
+  for (let index = 0; index < 15; index += 1) {
+    await createOneBill(service, accountId, { bookId: "1", type: 0, money: 1, categoryId: "2" });
+  }
   const results = await Promise.allSettled([
     createOneBill(service, accountId, { bookId: "1", type: 0, money: 2, categoryId: "2" }),
     createOneBill(service, sharedAccount.id, { bookId: "1", type: 0, money: 3, categoryId: "2" }),
   ]);
-  assert.deepEqual(results.map(({ status }) => status).sort(), ["fulfilled", "rejected"]);
-  const rejected = results.find(({ status }) => status === "rejected") as PromiseRejectedResult;
-  assert.equal(rejected.reason instanceof AppError && rejected.reason.code, "DAILY_WRITE_LIMIT_REACHED");
-  assert.deepEqual(store.getWriteQuota(account.id), { date: today, used: 15 });
+  assert.deepEqual(results.map(({ status }) => status), ["fulfilled", "fulfilled"]);
 });
 
-test("上游失败释放额度，远端成功但写后确认失败仍计一次", async (t) => {
+test("上游失败与远端成功但写后确认失败返回各自明确错误", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = Date.UTC(2026, 7, 12, 4);
-  const today = "2026-08-12";
   cacheWriteContext(store, account, { id: account.uid, viptype: -1, vipstart: 0, vipend: 0 }, ["tag-1"], now);
   const failed = new MoneyTrackService(
     store,
@@ -1176,7 +1162,6 @@ test("上游失败释放额度，远端成功但写后确认失败仍计一次",
     createOneBill(failed, accountId, { bookId: "1", type: 0, money: 1, categoryId: "2" }),
     (error) => error instanceof AppError && error.code === "WRITE_FAILED",
   );
-  assert.deepEqual(store.getWriteQuota(account.id), { date: today, used: 0 });
 
   const confirmationFailed = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input, init) => {
@@ -1195,7 +1180,6 @@ test("上游失败释放额度，远端成功但写后确认失败仍计一次",
       error.code === "WRITE_CONFIRMATION_FAILED" &&
       error.message.includes("refresh_cache"),
   );
-  assert.deepEqual(store.getWriteQuota(account.id), { date: today, used: 1 });
 });
 
 test("写入不会在用户缓存过期且刷新失败时沿用旧 VIP 权限", async (t) => {
@@ -1232,7 +1216,6 @@ test("写入不会在用户缓存过期且刷新失败时沿用旧 VIP 权限", 
   );
   assert.equal(initCalls, 1);
   assert.deepEqual(paths, ["/client/init"]);
-  assert.deepEqual(store.getWriteQuota(account.id), { date: null, used: 0 });
 });
 
 test("同步分页固定初始 lasttimes，并原子 upsert changes/delete deletes", async (t) => {
@@ -2351,7 +2334,6 @@ test("批量同步部分成功时保留成功项、配额和逐项结果", async
   );
   const remaining = await service.listBills(accountId, { allBooks: true });
   assert.deepEqual(remaining.bills.map(({ remark }) => remark), ["成功项"]);
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-12", used: 1 });
 });
 
 test("普通支出可切换待报销状态且收入不能标记待报销", async (t) => {
@@ -3080,7 +3062,6 @@ test("create_refund 拒绝返回与请求完整指纹不一致的新退款", asy
   const refunds = (await service.listBills(accountId, { allBooks: true, type: 20 })).bills;
   assert.equal(refunds.length, 1);
   assert.equal(refunds[0]?.remark, "上一笔退款");
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-15", used: 1 });
 });
 
 test("退款完整指纹同时校验子账单的源账单关系", () => {
@@ -3101,7 +3082,7 @@ test("退款完整指纹同时校验子账单的源账单关系", () => {
   }), false);
 });
 
-test("退款远端成功但写后 pull 失败时保留响应且仍计写入额度", async (t) => {
+test("退款远端成功但写后 pull 失败时保留响应", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = Date.UTC(2026, 7, 12, 4);
@@ -3126,7 +3107,6 @@ test("退款远端成功但写后 pull 失败时保留响应且仍计写入额�
       error.message.includes("refresh_cache"),
   );
   assert.equal(store.countBills(account.id), 2);
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-12", used: 1 });
 });
 
 test("批量报销一次计额、保存全部账单、失效资产缓存并用源账单取消", async (t) => {
@@ -3176,7 +3156,6 @@ test("批量报销一次计额、保存全部账单、失效资产缓存并用�
     [sourceA]: { sourceCurrency: "USD", sourceAmount: 10, targetCurrency: "CNY", targetAmount: 70, baseCurrency: "CNY", baseAmount: 70 },
     [sourceB]: { sourceCurrency: "USD", sourceAmount: 2, targetCurrency: "CNY", targetAmount: 14, baseCurrency: "CNY", baseAmount: 14 },
   });
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-12", used: 1 });
   assert.equal(store.getCatalogCache(account.id, "assets"), undefined);
   assert.equal((await service.getBills(accountId, [sourceA]))[0]!.reimbursementBillIds instanceof Array, true);
   const overage = await service.reimburseBills(accountId, {
@@ -3196,7 +3175,6 @@ test("批量报销一次计额、保存全部账单、失效资产缓存并用�
   assert.equal(((await service.getBills(accountId, [sourceA]))[0]!.reimbursementBillIds as string[]).length, 1);
 
   assert.deepEqual(await service.cancelReimbursements(accountId, [sourceA, sourceB]), { cancelled: true });
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-12", used: 4 });
   assert.equal((await service.getBills(accountId, [sourceA]))[0]!.reimbursementBillIds, undefined);
   assert.deepEqual(upstream.cancelledSourceIds, [sourceA, sourceB]);
 
@@ -3246,13 +3224,11 @@ test("新版报销迁移必须明确同意，并在迁移后重新校验且只�
   );
   assert.equal(reimbursementAttempts, 1);
   assert.equal(upgradeCalls, 0);
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-17", used: 0 });
 
   const result = await service.reimburseBills(accountId, { ...input, confirmReimbursementUpgrade: true });
   assert.equal(result.bills.length, 2);
   assert.equal(reimbursementAttempts, 3);
   assert.equal(upgradeCalls, 1);
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-17", used: 1 });
 });
 
 test("迁移成功但报销失败时明确报告部分成功且不重复迁移", async (t) => {
@@ -3304,7 +3280,6 @@ test("迁移成功但报销失败时明确报告部分成功且不重复迁移",
   );
   assert.equal(reimbursementAttempts, 1);
   assert.equal(upgradeCalls, 1);
-  assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-17", used: 0 });
 });
 
 function cacheBusinessContext(store: Store, account: QianjiAccount, now: number, vip: boolean): void {

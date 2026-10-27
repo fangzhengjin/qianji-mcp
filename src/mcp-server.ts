@@ -327,33 +327,23 @@ const userInfoFields = {
   vipStart: isoTimeOutputSchema.nullable().describe(`VIP 生效时间，${outputTimeDescription}，未开通时为 null`),
   vipEnd: isoTimeOutputSchema.nullable().describe(`VIP 失效时间，${outputTimeDescription}，该时刻起视为过期，未开通时为 null`),
   baseCurrency: currencySymbolSchema.describe("当前钱迹账户本位币标识，跨币种记账和默认统计口径均以此为准"),
-  timeZone: z.string().describe("账号当前记账时区的 IANA 名称，统计分桶、预算期间、写入额度和时间渲染均按该时区执行，可用 set_user_timezone 修改"),
+  timeZone: z.string().describe("账号当前记账时区的 IANA 名称，统计分桶、预算期间和时间渲染均按该时区执行，可用 set_user_timezone 修改"),
 };
 
 const billCurrencyInputSchema = z.strictObject({
   sourceCurrency: currencySymbolSchema.describe("普通账单的来源币种标识"),
-  targetAmount: nonnegativeMoneySchema.optional().describe("目标资产币种金额"),
-  baseAmount: nonnegativeMoneySchema.optional().describe("本位币金额"),
+  targetAmount: nonnegativeMoneySchema.optional().describe(conversionTargetAmountDescription),
+  baseAmount: nonnegativeMoneySchema.optional().describe(conversionBaseAmountDescription),
 });
 const derivedCurrencyInputSchema = z.strictObject({
-  targetAmount: nonnegativeMoneySchema.optional().describe("目标资产币种金额"),
-  baseAmount: nonnegativeMoneySchema.optional().describe("本位币金额"),
+  targetAmount: nonnegativeMoneySchema.optional().describe(conversionTargetAmountDescription),
+  baseAmount: nonnegativeMoneySchema.optional().describe(conversionBaseAmountDescription),
 }).refine((value) => value.targetAmount !== undefined || value.baseAmount !== undefined, "currencyConversion 至少包含 targetAmount 或 baseAmount")
   .meta({ required: [] });
-const userInfoSchema = z.discriminatedUnion("isVip", [
-  z.strictObject({
-    ...userInfoFields,
-    isVip: z.literal(true).describe("有效 VIP，不适用每日写入额度，结果不包含额度字段"),
-  }),
-  z.strictObject({
-    ...userInfoFields,
-    isVip: z.literal(false).describe("非有效 VIP，结果包含当日共享写入额度"),
-    dailyWriteLimit: z.number().int().nonnegative().describe("当日成功业务写入上限，单位为次"),
-    dailyWriteUsed: z.number().int().nonnegative().describe("当日已用成功业务写入次数，单位为次"),
-    dailyWriteRemaining: z.number().int().nonnegative().describe("当日剩余成功业务写入次数，单位为次"),
-    dailyWriteResetsAt: isoTimeOutputSchema.describe(`额度在记账时区次日零点重置，${outputTimeDescription}`),
-  }),
-]);
+const userInfoSchema = z.strictObject({
+  ...userInfoFields,
+  isVip: z.boolean().describe("当前时刻是否具备有效 VIP 权益，决定单次写入可用标签上限"),
+});
 
 const createInput = z.strictObject({
   bookId: defaultBookIdText,
@@ -646,7 +636,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "connect_qianji",
     {
-      description: "获取钱迹账号登录或重新登录的一次性链接",
+      description: `获取钱迹账号登录或重新登录的一次性链接，链接签发后 ${BINDING_TICKET_TTL_MINUTES} 分钟内有效`,
       inputSchema: z.strictObject({}).meta({ required: [] }),
       outputSchema: z.object({
         url: z.string().url().describe("一次性钱迹登录链接"),
@@ -833,7 +823,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "get_user_info",
     {
-      description: "返回当前钱迹用户、账户本位币、VIP 状态及适用时的当日写入额度信息",
+      description: "返回当前钱迹用户、账户本位币和 VIP 状态信息",
       inputSchema: z.strictObject({}).meta({ required: [] }),
       outputSchema: userInfoSchema.describe("当前钱迹用户信息"),
       annotations: readAnnotations,
@@ -1380,7 +1370,6 @@ const TIME_OUTPUT_FIELDS = new Set([
   "registeredAt",
   "vipStart",
   "vipEnd",
-  "dailyWriteResetsAt",
   "finishedAt",
   "nextRepaymentDate",
   "expiresAt",

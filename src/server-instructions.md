@@ -8,7 +8,7 @@
 
 #### 查询
 
-- 用户信息、账户本位币、VIP 状态或写入额度：使用 `get_user_info`
+- 用户信息、账户本位币或 VIP 状态：使用 `get_user_info`
 - 账本：使用 `list_books`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围
 - 资产：使用 `list_assets`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围，仅在用户明确要求查看余额或额度时设 `includeBalances=true`
 - 借入或借出详情：使用 `list_debt_accounts`，不得从 `list_assets` 的 type 5 债务条目聚合借入或借出详情
@@ -67,7 +67,7 @@
 - 标签和成员 ID 使用对应查询返回的原始字符串，不得按数值 ID 猜测或改写
 - 金额使用币种主单位，不使用分、美分等最小货币单位
 - 时间字段一律使用带时区偏移的 ISO 8601 时刻，输入接受任意时区偏移，输出按当前记账时区渲染，向用户展示时间时换算到用户所在时区并标注
-- 统计、预算和写入额度的日期口径使用当前记账时区，默认东八区，调用 `set_user_timezone` 前必须先与用户确认
+- 统计和预算的日期口径使用当前记账时区，默认东八区，调用 `set_user_timezone` 前必须先与用户确认
 - `money`、`fee` 和 `discount` 的业务含义以工具字段说明为准，输入结构约束以 Schema 为准
 - 服务端自动换算时，汇率按 HALF_UP 保留 10 位，换算金额按 HALF_EVEN 保留 2 位
 - 跨币种账单使用 `get_user_info.baseCurrency` 解释本位币，读取历史账单时使用 `currencyConversion` 的保存值，不用当前汇率重算

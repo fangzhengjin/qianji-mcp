@@ -208,12 +208,10 @@ function assertUnitDescriptions(schema: unknown, path: string): void {
       const description = String((child as Record<string, unknown>).description ?? "");
       if (name === "money" || name === "fee" || name === "discount") {
         assert.match(description, /币种主单位.*不使用.*最小货币单位.*CNY.*USD.*JPY/, `${path}.${name} must state the currency unit`);
-      } else if (["time", "startTime", "endTime", "createTime", "createStartTime", "createEndTime", "updateTime", "registeredAt", "vipStart", "vipEnd", "expiresAt", "createdAt", "dailyWriteResetsAt"].includes(name)) {
+      } else if (["time", "startTime", "endTime", "createTime", "createStartTime", "createEndTime", "updateTime", "registeredAt", "vipStart", "vipEnd", "expiresAt", "createdAt"].includes(name)) {
         assert.match(description, /ISO 8601/, `${path}.${name} must state the time format`);
       } else if (name === "memberCount") {
         assert.match(description, /单位为人/, `${path}.${name} must state the count unit`);
-      } else if (["dailyWriteLimit", "dailyWriteUsed", "dailyWriteRemaining"].includes(name)) {
-        assert.match(description, /单位为次/, `${path}.${name} must state the quota unit`);
       } else if (["bookCount", "visibleBookCount", "hiddenBookCount", "assetCount", "categoryCount", "tagCount"].includes(name)) {
         assert.match(description, /单位为个/, `${path}.${name} must state the count unit`);
       } else if (name === "billCount" || (name === "limit" && /每页条数/.test(description))) {
@@ -599,18 +597,15 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.match(String(schemaNode(budgetOutput, "categories", "items", "billCount").description), /零消耗.*不计预算.*仍计入/);
   assert.match(String(schemaNode(budgetOutput, "dailyStatistics").description), /includeDailyStatistics=true.*每个日历日/);
   const userSchema = tools.find(({ name }) => name === "get_user_info")?.outputSchema as Record<string, unknown>;
-  const userBranches = userSchema.oneOf as Record<string, unknown>[];
-  assert.equal(userBranches.length, 2);
-  const vipBranch = userBranches.find((branch) => schemaNode(branch, "isVip").const === true)!;
-  const nonVipBranch = userBranches.find((branch) => schemaNode(branch, "isVip").const === false)!;
-  assert.equal("dailyWriteLimit" in (vipBranch.properties as Record<string, unknown>), false);
-  assert.equal("platform" in (vipBranch.properties as Record<string, unknown>), false);
-  assert.equal("registrationMethod" in (vipBranch.properties as Record<string, unknown>), true);
-  assert.deepEqual(schemaNode(vipBranch, "registrationMethod").enum, ["手机号", "微博", "QQ", "邮箱", "微信", "Apple ID", "华为账号"]);
-  assert.equal(schemaNode(vipBranch, "registrationMethod").anyOf, undefined);
-  assert.deepEqual(nonVipBranch.required, [
+  assert.equal(userSchema.oneOf, undefined);
+  const userProperties = userSchema.properties as Record<string, unknown>;
+  assert.equal("dailyWriteLimit" in userProperties, false);
+  assert.equal("platform" in userProperties, false);
+  assert.equal("registrationMethod" in userProperties, true);
+  assert.deepEqual(schemaNode(userSchema, "registrationMethod").enum, ["手机号", "微博", "QQ", "邮箱", "微信", "Apple ID", "华为账号"]);
+  assert.equal(schemaNode(userSchema, "registrationMethod").anyOf, undefined);
+  assert.deepEqual(userSchema.required, [
     "id", "name", "avatar", "registeredAt", "vipType", "vipStart", "vipEnd", "baseCurrency", "timeZone", "isVip",
-    "dailyWriteLimit", "dailyWriteUsed", "dailyWriteRemaining", "dailyWriteResetsAt",
   ]);
   assert.deepEqual(
     schemaNode(tools.find(({ name }) => name === "update_bills")?.inputSchema, "updates", "items", "patch").required,
@@ -929,7 +924,7 @@ test("MCP 输入 schema 接受边界并在进入业务逻辑前拒绝越界字�
   }
 });
 
-test("get_user_info 只返回最小资料、缓存期 VIP 和额度字段", async (t) => {
+test("get_user_info 只返回最小资料与缓存期 VIP 状态", async (t) => {
   const now = Math.floor(Date.now() / 1000);
   const { store, app, token } = setupApp({
     fetch: async (input) => {

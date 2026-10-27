@@ -15,7 +15,6 @@ import {
   type SyncBatch,
   type UserCache,
   type UnbindResult,
-  type WriteQuota,
 } from "./data-store.ts";
 import { AppError } from "./errors.ts";
 import { parseQianjiJson } from "./qianji-client.ts";
@@ -249,30 +248,6 @@ export class ServerStore implements DataStore {
     await this.query(this.sql, "UPDATE accounts SET user_json = ?, user_refreshed_at_ms = ? WHERE id = ?", [JSON.stringify(user), refreshedAtMs, accountId]);
   }
 
-  /** 读取持久化的每日写入配额 */
-  async getWriteQuota(accountId: number): Promise<WriteQuota> {
-    const row = (await this.query(this.sql, "SELECT write_quota_date, write_quota_used FROM accounts WHERE id = ?", [accountId]))[0];
-    if (!row) throw new AppError("QIANJI_ACCOUNT_NOT_BOUND", "尚未绑定钱迹账号");
-    return { date: row.write_quota_date === null ? null : String(row.write_quota_date), used: Number(row.write_quota_used) };
-  }
-
-  /** 使用跨进程共享的行锁预占一个非 VIP 写入名额 */
-  async reserveWriteQuota(accountId: number, date: string, limit: number): Promise<WriteQuota> {
-    return this.sql.begin(async (tx) => {
-      const row = (await this.query(tx, "SELECT write_quota_date, write_quota_used FROM accounts WHERE id = ? FOR UPDATE", [accountId]))[0];
-      if (!row) throw new AppError("QIANJI_ACCOUNT_NOT_BOUND", "尚未绑定钱迹账号");
-      const used = row.write_quota_date === date ? Number(row.write_quota_used) : 0;
-      if (used >= limit) throw new AppError("DAILY_WRITE_LIMIT_REACHED", `今日成功业务写入已达到 ${limit} 次上限`);
-      await this.query(tx, "UPDATE accounts SET write_quota_date = ?, write_quota_used = ? WHERE id = ?", [date, used + 1, accountId]);
-      return { date, used: used + 1 };
-    });
-  }
-
-  /** 上游未接受写入时释放预占名额 */
-  async releaseWriteQuota(accountId: number, date: string): Promise<void> {
-    await this.query(this.sql, "UPDATE accounts SET write_quota_used = write_quota_used - 1 WHERE id = ? AND write_quota_date = ? AND write_quota_used > 0", [accountId, date]);
-  }
-
   /** 统计一个账号的全部本地缓存账单 */
   async countBills(accountId: number): Promise<number> {
     return Number((await this.query(this.sql, "SELECT COUNT(*) AS count FROM bills WHERE account_id = ?", [accountId]))[0]!.count);
@@ -483,7 +458,7 @@ function schemaStatements(dialect: Dialect): string[] {
   const double = dialect === "postgres" ? "DOUBLE PRECISION" : "DOUBLE";
   const adminColumn = dialect === "mysql" ? ", admin_guard VARCHAR(5) GENERATED ALWAYS AS (CASE WHEN role = 'admin' THEN 'admin' ELSE NULL END) STORED UNIQUE" : "";
   const statements = [
-    `CREATE TABLE IF NOT EXISTS accounts (id ${serial}, uid VARCHAR(255)${dialect === "mysql" ? " CHARACTER SET utf8mb4 COLLATE utf8mb4_bin" : ""} NOT NULL UNIQUE, utoken TEXT NOT NULL, devid VARCHAR(255) NOT NULL, login_identifier VARCHAR(320), created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, user_json ${text}, user_refreshed_at_ms BIGINT, write_quota_date VARCHAR(10), write_quota_used INTEGER NOT NULL DEFAULT 0 CHECK (write_quota_used >= 0), timezone VARCHAR(64))${dialect === "mysql" ? " ENGINE=InnoDB" : ""}`,
+    `CREATE TABLE IF NOT EXISTS accounts (id ${serial}, uid VARCHAR(255)${dialect === "mysql" ? " CHARACTER SET utf8mb4 COLLATE utf8mb4_bin" : ""} NOT NULL UNIQUE, utoken TEXT NOT NULL, devid VARCHAR(255) NOT NULL, login_identifier VARCHAR(320), created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, user_json ${text}, user_refreshed_at_ms BIGINT, timezone VARCHAR(64))${dialect === "mysql" ? " ENGINE=InnoDB" : ""}`,
     `CREATE TABLE IF NOT EXISTS pats (id ${serial}, account_id BIGINT, token VARCHAR(255)${dialect === "mysql" ? " CHARACTER SET ascii COLLATE ascii_bin" : ""} NOT NULL UNIQUE, role VARCHAR(5) NOT NULL CHECK (role IN ('admin', 'user')), remark VARCHAR(100) NOT NULL, expires_at BIGINT, created_at BIGINT NOT NULL${adminColumn}, FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE)${dialect === "mysql" ? " ENGINE=InnoDB" : ""}`,
     `CREATE TABLE IF NOT EXISTS sync_state (account_id BIGINT PRIMARY KEY, lasttimes_json ${text} NOT NULL, FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE)${dialect === "mysql" ? " ENGINE=InnoDB" : ""}`,
     `CREATE TABLE IF NOT EXISTS catalog_cache (account_id BIGINT NOT NULL, kind VARCHAR(10) NOT NULL, scope VARCHAR(255) NOT NULL, data_json ${text} NOT NULL, refreshed_at_ms BIGINT NOT NULL, CONSTRAINT qianji_catalog_kind_check CHECK (kind IN ('books', 'assets', 'categories', 'tags', 'currencies')), PRIMARY KEY (account_id, kind, scope), FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE)${dialect === "mysql" ? " ENGINE=InnoDB" : ""}`,

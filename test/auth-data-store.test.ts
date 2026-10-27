@@ -396,7 +396,7 @@ test("bun:sqlite 保持 WAL、外键、事务回滚和 64 位业务 ID 精度", 
   });
 });
 
-test("旧 accounts 表升级后具备登录标识、用户缓存与 UID 共享额度列", (t) => {
+test("旧 accounts 表升级后具备登录标识、用户缓存与时区列", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "qianji-account-cache-migration-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const path = join(directory, "qianji.db");
@@ -426,20 +426,16 @@ test("旧 accounts 表升级后具备登录标识、用户缓存与 UID 共享�
     "updated_at",
     "user_json",
     "user_refreshed_at_ms",
-    "write_quota_date",
-    "write_quota_used",
     "login_identifier",
     "timezone",
   ]);
   const row = migrated.db.prepare(`
-    SELECT user_json, user_refreshed_at_ms, write_quota_date, write_quota_used, login_identifier
+    SELECT user_json, user_refreshed_at_ms, login_identifier
     FROM accounts WHERE id = 1
   `).get() as Record<string, unknown>;
   assert.deepEqual(row, {
     user_json: null,
     user_refreshed_at_ms: null,
-    write_quota_date: null,
-    write_quota_used: 0n,
     login_identifier: null,
   });
 });
